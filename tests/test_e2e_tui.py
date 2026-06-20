@@ -206,18 +206,22 @@ except Exception as e:
     check("Ollama + gemma4:e4b", False, str(e))
 
 # ── Determine launch command ──────────────────────────────────────────────
-if has_wrapper:
+# THMES_BIN overrides everything — lets us e2e a specific checkout (e.g. a fresh
+# clone) even when an installed ~/.local/bin/thmes wrapper exists.
+_py = next(
+    (os.path.expanduser(f"{v}/bin/python") for v in _VENV_CANDIDATES
+     if Path(os.path.expanduser(f"{v}/bin/python")).exists()),
+    "python3"
+)
+if os.environ.get("THMES_BIN"):
+    launch_cmd = f"THMES_MODEL=ol:gemma4:e4b {_py} {os.environ['THMES_BIN']}"
+elif has_wrapper:
     for _n in _WRAPPER_NAMES:
         _w = os.path.expanduser(f"~/.local/bin/{_n}")
         if Path(_w).exists():
             launch_cmd = _w
             break
 else:
-    _py = next(
-        (os.path.expanduser(f"{v}/bin/python") for v in _VENV_CANDIDATES
-         if Path(os.path.expanduser(f"{v}/bin/python")).exists()),
-        "python3"
-    )
     launch_cmd = f"THMES_MODEL=ol:gemma4:e4b {_py} {_find_src(REPO)}"
 
 # ── Run E2E suite ─────────────────────────────────────────────────────────
