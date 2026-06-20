@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Local data (should not be in repo)
+data/*
+!data/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Logs / temp
+*.log
+.thmes-history
+
+# Optional external CLI shims (not part of THMES core)
+bin/ctx/
+
+# Local Claude Code config
+.claude/
+
+# Project-level Claude instructions (local only)
+CLAUDE.md
+
+# Junk
+empty_file.txt
+empty_test_file.txt

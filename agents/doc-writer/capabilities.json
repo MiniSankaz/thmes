@@ -1,0 +1,19 @@
+{
+  "primary": [
+    "read",
+    "write",
+    "edit",
+    "execute",
+    "test"
+  ],
+  "tool_preferences": [
+    "opencode",
+    "read_file",
+    "write_file",
+    "bash"
+  ],
+  "delegates_to": [
+    "opencode"
+  ],
+  "context_budget_pct": 0.7
+}

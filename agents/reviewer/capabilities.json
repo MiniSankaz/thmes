@@ -1,0 +1,16 @@
+{
+  "primary": [
+    "read",
+    "review",
+    "audit",
+    "flag"
+  ],
+  "tool_preferences": [
+    "read_file",
+    "list_dir",
+    "grep",
+    "web_fetch"
+  ],
+  "delegates_to": [],
+  "context_budget_pct": 0.7
+}

@@ -1,0 +1,1281 @@
+#!/usr/bin/env -S /Users/semini/.mlx-env/bin/python
+"""thmes-pro — Textual-based agentic TUI (next-gen successor to thmes classic).
+
+Three-pane layout:
+  ┌──────────────────────────────────────────────────────────┐
+  │ Header: model · agent · ctx% · breaker · ⏱                │
+  ├──────────┬──────────────────────┬────────────────────────┤
+  │ Sessions │  Chat (markdown)     │  Monitor (stats/logs)  │
+  │  list    │  + tool call cards   │  + tool exec timeline  │
+  │          │                      │                        │
+  ├──────────┴──────────────────────┴────────────────────────┤
+  │ Input: > _                                                │
+  ├──────────────────────────────────────────────────────────┤
+  │ Footer: keybindings                                       │
+  └──────────────────────────────────────────────────────────┘
+
+Imports core (SessionStore, CircuitBreaker, agents) from thmes.
+"""
+from __future__ import annotations
+import importlib.util
+import json
+import os
+import queue
+import shutil
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Defuse tqdm + subprocess inside Textual ────────────────────────────────
+# Problem: mlx_vlm.generate_step uses tqdm("Prefill") which on broken stdout
+# (Textual hijacks it) falls back to spawning `stty size` subprocess. Inside
+# Textual's worker thread, subprocess fds are corrupted → fatal:
+#   "Error: bad value(s) in fds_to_keep"
+#
+# Solution: REPLACE tqdm classes with a no-op stub BEFORE any mlx_vlm import.
+# This neutralizes every tqdm variant (tqdm.tqdm, tqdm.auto.tqdm, etc).
+
+_FAKE_SIZE = (140, 40)
+shutil.get_terminal_size = lambda fallback=_FAKE_SIZE: os.terminal_size(_FAKE_SIZE)
+os.environ.setdefault("TQDM_DISABLE", "1")
+
+class _NoOpTqdm:
+    """Drop-in replacement that does nothing — no subprocess, no terminal probe.
+
+    Also exposes class-level methods that HuggingFace Hub / transformers call.
+    """
+    monitor_interval = 10
+    _instances = set()
+
+    def __init__(self, iterable=None, *args, **kwargs):
+        self.iterable = iterable if iterable is not None else []
+        self.n = 0
+        self.total = kwargs.get("total")
+        self.desc = kwargs.get("desc", "")
+        self.disable = True
+    def __iter__(self):
+        for item in self.iterable:
+            self.n += 1
+            yield item
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+    def update(self, n=1):       self.n += n
+    def close(self):             pass
+    def set_description(self, *a, **kw): pass
+    def set_description_str(self, *a, **kw): pass
+    def set_postfix(self, *a, **kw):     pass
+    def set_postfix_str(self, *a, **kw): pass
+    def write(self, msg, *a, **kw):      pass
+    def refresh(self):           pass
+    def reset(self, total=None): self.n = 0; self.total = total
+    def display(self, *a, **kw): pass
+    def clear(self, *a, **kw):   pass
+    def __getattr__(self, name): return lambda *a, **kw: None
+    # ── Class-level methods huggingface_hub / multiprocessing expect ───
+    @classmethod
+    def set_lock(cls, lock): cls._lock = lock
+    @classmethod
+    def get_lock(cls): return getattr(cls, "_lock", None)
+    @classmethod
+    def write_class(cls, *a, **kw): pass
+    @staticmethod
+    def format_sizeof(num, *a, **kw): return str(num)
+    @staticmethod
+    def format_interval(t): return f"{t:.0f}s"
+    @staticmethod
+    def format_meter(*a, **kw): return ""
+    @staticmethod
+    def status_printer(*a, **kw):
+        return lambda *a, **kw: None
+    @classmethod
+    def pandas(cls, *a, **kw): pass
+
+# Patch every tqdm export that mlx_vlm or transformers might use
+try:
+    import tqdm as _tqdm_pkg
+    _tqdm_pkg.tqdm = _NoOpTqdm
+    if hasattr(_tqdm_pkg, "trange"):
+        _tqdm_pkg.trange = lambda *a, **kw: _NoOpTqdm(range(*a))
+    try:
+        import tqdm.auto as _tqdm_auto
+        _tqdm_auto.tqdm = _NoOpTqdm
+        if hasattr(_tqdm_auto, "trange"):
+            _tqdm_auto.trange = lambda *a, **kw: _NoOpTqdm(range(*a))
+    except ImportError: pass
+    try:
+        import tqdm.std as _tqdm_std
+        _tqdm_std.tqdm = _NoOpTqdm
+    except ImportError: pass
+    try:
+        import tqdm.notebook as _tqdm_nb
+        _tqdm_nb.tqdm = _NoOpTqdm
+    except ImportError: pass
+except ImportError:
+    pass
+
+# ── Single-instance lockfile ──────────────────────────────────────────────
+# Data home — migrate a pre-existing ~/.gemma-tui (old project name) once.
+_THMES_HOME = Path.home() / ".thmes"
+_LEGACY_HOME = Path.home() / ".gemma-tui"
+if _LEGACY_HOME.exists() and not _THMES_HOME.exists():
+    try:
+        _LEGACY_HOME.rename(_THMES_HOME)
+    except Exception:
+        _THMES_HOME = _LEGACY_HOME
+_LOCK_PATH = _THMES_HOME / "data" / "thmes-pro.pid"
+
+def _acquire_lock() -> bool:
+    """Returns True if this process owns the lock, False if another instance is alive."""
+    _LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if _LOCK_PATH.exists():
+        try:
+            old_pid = int(_LOCK_PATH.read_text().strip())
+            # Check if PID is alive
+            try:
+                os.kill(old_pid, 0)
+                # Process exists
+                return False
+            except ProcessLookupError:
+                pass  # stale lock — overwrite
+        except (ValueError, OSError):
+            pass
+    _LOCK_PATH.write_text(str(os.getpid()))
+    return True
+
+def _release_lock():
+    try:
+        if _LOCK_PATH.exists() and _LOCK_PATH.read_text().strip() == str(os.getpid()):
+            _LOCK_PATH.unlink()
+    except Exception: pass
+
+if not _acquire_lock():
+    other_pid = _LOCK_PATH.read_text().strip()
+    print(f"\033[1;31mAnother thmes-pro is already running (PID {other_pid}).\033[0m")
+    print(f"  • Switch to that terminal, or")
+    print(f"  • If it's stale: rm {_LOCK_PATH} && thmes-pro")
+    sys.exit(1)
+
+# Clear screen scrollback before app starts (kills leftover artifacts)
+sys.stdout.write("\033[2J\033[H\033[3J")  # clear screen + home cursor + clear scrollback
+sys.stdout.flush()
+
+import atexit
+import signal
+
+def _emergency_cleanup(*_):
+    """Restore terminal to sane state on any abnormal exit."""
+    # Exit alternate screen buffer + show cursor + reset attributes
+    sys.stdout.write("\033[?1049l\033[?25h\033[0m")
+    sys.stdout.flush()
+    _release_lock()
+    sys.exit(1)
+
+atexit.register(_release_lock)
+# Catch common termination signals to avoid leaving terminal in alt-buffer
+for _sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    try: signal.signal(_sig, _emergency_cleanup)
+    except (OSError, ValueError): pass
+
+# ── Resolve project lib dir relative to this file (works wherever installed) ──
+_SCRIPT_DIR = Path(__file__).resolve().parent
+# Try same-directory layout (project root): bin/thmes-pro + lib/*.py
+_PROJ_LIB = _SCRIPT_DIR.parent / "lib"
+_LEGACY_LIB = Path.home() / ".local/share/thmes"
+for _candidate in (_PROJ_LIB, _LEGACY_LIB):
+    if _candidate.is_dir() and (_candidate / "thmes_mcp.py").exists():
+        sys.path.insert(0, str(_candidate))
+        break
+
+try:
+    from thmes_mcp import SyncMCPClient
+    MCP_AVAILABLE = True
+except ImportError:
+    MCP_AVAILABLE = False
+try:
+    from thmes_memory import MemoryService, EmbeddingEngine
+    MEMORY_AVAILABLE = True
+except ImportError:
+    MEMORY_AVAILABLE = False
+try:
+    from thmes_orchestrator import Orchestrator, OrchestrationStore
+    ORCH_AVAILABLE = True
+except ImportError:
+    ORCH_AVAILABLE = False
+try:
+    from thmes_goals import GoalQueue
+    GOALS_AVAILABLE = True
+except ImportError:
+    GOALS_AVAILABLE = False
+try:
+    import thmes_notify
+    NOTIFY_AVAILABLE = True
+except ImportError:
+    NOTIFY_AVAILABLE = False
+try:
+    from thmes_registry import get_registry
+    REGISTRY_AVAILABLE = True
+except ImportError:
+    REGISTRY_AVAILABLE = False
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll, Container
+from textual.reactive import reactive
+from textual.widget import Widget
+from textual.widgets import (
+    Header, Footer, Input, Static, ListView, ListItem, Label,
+    Markdown, RichLog, ProgressBar,
+)
+from textual.worker import Worker, WorkerState
+from rich.text import Text
+from rich.panel import Panel
+from rich.table import Table
+
+# ╔════════════════════════════════════════════════════════════════════════╗
+# ║ Load thmes core via importlib (reuse SessionStore, breaker, etc)      ║
+# ╚════════════════════════════════════════════════════════════════════════╝
+# Find thmes core (prefer sibling in same bin/ dir, fall back to ~/.local/bin)
+_THMES_CORE_PATH = _SCRIPT_DIR / "thmes"
+if not _THMES_CORE_PATH.exists():
+    _THMES_CORE_PATH = Path.home() / ".local/bin/thmes"
+_spec = importlib.util.spec_from_loader(
+    "thmes_core",
+    importlib.machinery.SourceFileLoader("thmes_core", str(_THMES_CORE_PATH))
+)
+core = importlib.util.module_from_spec(_spec)
+sys.modules["thmes_core"] = core
+_spec.loader.exec_module(core)
+
+MODELS         = core.MODELS
+MODEL_CONTEXT  = core.MODEL_CONTEXT
+DEFAULT_MODEL  = core.DEFAULT_MODEL
+DEFAULT_MAX_TOKENS = core.DEFAULT_MAX_TOKENS
+SESSIONS_DB    = core.SESSIONS_DB
+SessionStore   = core.SessionStore
+CircuitBreaker = core.CircuitBreaker
+ModelManager   = core.ModelManager
+TOOLS          = core.TOOLS
+TOOL_RISK      = core.TOOL_RISK
+load_agents    = core.load_agents
+load_skills    = core.load_skills
+smart_route    = core.smart_route
+agent_turn     = core.agent_turn
+tools_system_block = core.tools_system_block
+measure_context    = core.measure_context
+compact_history    = core.compact_history
+parse_tool_calls   = core.parse_tool_calls
+
+
+# ╔════════════════════════════════════════════════════════════════════════╗
+# ║ Widgets                                                                ║
+# ╚════════════════════════════════════════════════════════════════════════╝
+class SessionListItem(ListItem):
+    def __init__(self, session: dict):
+        super().__init__()
+        self.session = session
+
+    def compose(self) -> ComposeResult:
+        s = self.session
+        title = (s["title"] or "(untitled)")[:24]
+        msgs = s["message_count"]
+        when = s["updated_at"][11:16] if s["updated_at"] else "—"
+        # One-line layout to avoid sub-row clipping
+        yield Label(f"[bold]{title}[/] [dim]{when}·{msgs}m[/]")
+
+
+# Single global stylesheet — easier to reason about than per-widget DEFAULT_CSS
+APP_CSS = """
+Screen { layout: vertical; background: $background; }
+
+/* ── Top bar ──────────────────────────────────────────────────────────── */
+Header { dock: top; height: 1; background: $boost; }
+
+/* ── Body (3 columns) ─────────────────────────────────────────────────── */
+#body { layout: horizontal; height: 1fr; }
+
+/* Left: sessions sidebar — responsive width */
+#sessions-pane {
+    layout: vertical;
+    width: 22%;
+    min-width: 22;
+    max-width: 40;
+    background: $surface;
+}
+#sessions-pane.hidden { display: none; }
+.pane-title {
+    background: $primary;
+    color: $background;
+    padding: 0 1;
+    text-style: bold;
+    height: 1;
+    min-height: 1;
+    max-height: 1;
+    width: 1fr;
+}
+#sessions-pane > ListView {
+    height: 1fr;
+    background: $surface;
+    border-right: solid $accent;
+}
+ListItem { padding: 0 1; }
+ListItem.--highlight { background: $primary 30%; }
+
+/* Center: chat + input stacked */
+#center-pane {
+    layout: vertical;
+    width: 1fr;
+    height: 1fr;
+}
+#chat-scroll {
+    height: 1fr;
+    padding: 0 1;
+    background: $background;
+}
+#chat-scroll Label.user      { color: $accent;  text-style: bold; margin-top: 1; }
+#chat-scroll Label.assistant { color: $success; text-style: bold; margin-top: 1; }
+#chat-scroll Static.body     { margin-left: 2; margin-bottom: 1; }
+#chat-scroll Static.streaming{
+    margin-left: 2;
+    margin-bottom: 1;
+    padding: 0 1;
+    background: $surface;
+}
+#chat-scroll Static.tool-call{
+    margin-left: 2;
+    margin-bottom: 0;
+    padding: 0 1;
+    border-left: tall $warning;
+}
+#chat-scroll Static.tool-result{
+    margin-left: 4;
+    margin-bottom: 1;
+    padding: 0 1;
+    color: $text-muted;
+}
+#chat-scroll Static.tool-result-error{
+    margin-left: 4;
+    margin-bottom: 1;
+    padding: 0 1;
+    color: $error;
+}
+#chat-scroll Markdown { margin-left: 2; margin-bottom: 1; }
+
+/* Input row — single line, no border bleed */
+#input-row {
+    height: 3;
+    background: $surface;
+    border-top: solid $accent;
+}
+#input-row Input {
+    width: 1fr;
+    height: 3;
+    border: none;
+    padding: 1 1 0 1;
+    background: $surface;
+}
+#input-row Input:focus { background: $boost; }
+
+/* Right: monitor — responsive width */
+#monitor-pane {
+    layout: vertical;
+    width: 28%;
+    min-width: 28;
+    max-width: 52;
+    background: $surface;
+    border-left: solid $accent;
+}
+#monitor-pane.hidden { display: none; }
+#monitor-pane #stats {
+    background: $surface;
+    padding: 0 1;
+    height: auto;
+    max-height: 12;
+}
+#monitor-pane RichLog {
+    height: 1fr;
+    background: $surface;
+    padding: 0 1;
+}
+
+/* ── Bottom bar ───────────────────────────────────────────────────────── */
+Footer { dock: bottom; height: 1; background: $boost; }
+"""
+
+
+class ChatPane(VerticalScroll):
+    """Plain VerticalScroll with chat append helpers (no per-widget CSS)."""
+
+    def append_user(self, text: str):
+        self.mount(Label("you ›", classes="user"))
+        self.mount(Static(text, classes="body"))
+        self.scroll_end()
+
+    def append_assistant(self, text: str):
+        self.mount(Label("thmes →", classes="assistant"))
+        self.mount(Markdown(text))
+        self.scroll_end()
+
+    def begin_stream(self) -> Static:
+        self.mount(Label("thmes →", classes="assistant"))
+        w = Static("", classes="streaming", markup=False)
+        self.mount(w)
+        self.scroll_end()
+        return w
+
+    def append_tool(self, name: str, args: dict, result: str = "", ok: bool = True):
+        args_str = json.dumps(args, ensure_ascii=False)[:200]
+        result_str = (result or "(no output)")[:400]
+        symbol = "✓" if ok else "✗"
+        kls = "tool-result" if ok else "tool-result-error"
+        self.mount(Static(f"🔧 [bold]{name}[/]({args_str})", classes="tool-call"))
+        self.mount(Static(f"{symbol} {result_str}", classes=kls))
+        self.scroll_end()
+
+    def append_system(self, text: str):
+        self.mount(Static(f"[dim italic]{text}[/]", classes="body"))
+        self.scroll_end()
+
+
+class MonitorPane:
+    """Wrapper that holds refs to stats Static + RichLog for clean updates."""
+    def __init__(self, stats: Static, log: RichLog):
+        self.stats_widget = stats
+        self.event_log = log
+
+    def update_stats(self, **kwargs):
+        t = Table(show_header=False, box=None, padding=(0, 1))
+        t.add_column(style="cyan", no_wrap=True); t.add_column()
+        for k, v in kwargs.items():
+            t.add_row(k, str(v))
+        self.stats_widget.update(t)
+
+    def event(self, msg: str, level: str = "info"):
+        ts = datetime.now().strftime("%H:%M:%S")
+        color = {"info":"dim","tool":"cyan","ok":"green","err":"red","warn":"yellow"}.get(level,"white")
+        self.event_log.write(f"[{color}][{ts}][/] {msg}")
+
+
+# ╔════════════════════════════════════════════════════════════════════════╗
+# ║ App                                                                    ║
+# ╚════════════════════════════════════════════════════════════════════════╝
+class MLXWorker:
+    """Single dedicated thread for ALL MLX operations.
+
+    Why: MLX's Metal streams are thread-bound. Spawning a fresh worker thread
+    per task means model loaded in thread A can't be used by thread B —
+    `RuntimeError: There is no Stream(gpu, 1) in current thread`.
+
+    Solution: one persistent thread that owns the stream and processes
+    submitted tasks via queue. Callbacks fire on completion.
+    """
+
+    def __init__(self, name: str = "mlx-worker"):
+        self.q: queue.Queue = queue.Queue()
+        self.thread = threading.Thread(target=self._loop, name=name, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while True:
+            item = self.q.get()
+            if item is None: return  # shutdown signal
+            func, args, kwargs, on_done = item
+            try:
+                result = func(*args, **kwargs)
+                if on_done: on_done(result, None)
+            except Exception as e:
+                if on_done: on_done(None, e)
+
+    def submit(self, func, *args, on_done=None, **kwargs):
+        """Queue a task. on_done(result, exception) fires when complete."""
+        self.q.put((func, args, kwargs, on_done))
+
+    def shutdown(self):
+        self.q.put(None)
+
+
+class ThmesProApp(App):
+    CSS = APP_CSS
+
+    BINDINGS = [
+        Binding("ctrl+d", "quit", "Quit"),
+        Binding("ctrl+l", "clear_chat", "Clear"),
+        Binding("ctrl+n", "new_session", "New"),
+        Binding("ctrl+r", "refresh_sessions", "Refresh"),
+        Binding("ctrl+shift+r", "screen_redraw", "Redraw"),
+        Binding("f1", "show_help", "Help"),
+        Binding("f2", "toggle_tools", "Tools"),
+        Binding("f3", "toggle_sessions_pane", "📂"),
+        Binding("f4", "toggle_monitor_pane", "📊"),
+    ]
+
+    TITLE = "thmes-pro"
+    SUB_TITLE = "Agentic TUI · Textual edition"
+
+    # Reactive state shown in footer
+    model_name = reactive("gemma")
+    agent_name = reactive("—")
+    tools_on   = reactive(True)
+    auto_load  = reactive(True)
+    ctx_pct    = reactive(0)
+    breaker_open = reactive(0)
+
+    def __init__(self):
+        super().__init__()
+        self.store = SessionStore(SESSIONS_DB)
+        # One-shot cleanup: archive all empty sessions from previous runs
+        try:
+            n_cleaned = 0
+            for s in self.store.list_sessions(limit=200):
+                if s["message_count"] == 0:
+                    self.store.archive(s["id"]); n_cleaned += 1
+            self._startup_cleaned = n_cleaned
+        except Exception:
+            self._startup_cleaned = 0
+        self.session_id = self.store.create_session(model=DEFAULT_MODEL, agent=None)
+        self.session_first_msg = True
+        self.history: list[dict] = []
+        self.agents = load_agents()
+        self.skills = load_skills()
+        self.mm = ModelManager()
+        self.breaker = CircuitBreaker()
+        self.current_agent = None
+        self.last_system = ""
+        self.mcp_client = None       # SyncMCPClient, lazy-init in _load_mcp_async
+        self.mcp_tools: list[dict] = []
+        self.memory = MemoryService() if MEMORY_AVAILABLE else None
+        self._embedding_loaded = False
+        self.orch_store = OrchestrationStore() if ORCH_AVAILABLE else None
+        self.goals = GoalQueue() if GOALS_AVAILABLE else None
+        self.mlx_worker = MLXWorker()      # owns all MLX state
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Horizontal(id="body"):
+            # ── Left: sessions sidebar ───────────────────────────────────
+            with Container(id="sessions-pane"):
+                yield Label("📂 Sessions", classes="pane-title")
+                self.session_list = ListView(id="session-list")
+                yield self.session_list
+            # ── Center: chat (scroll) + input (fixed bottom of column) ───
+            with Vertical(id="center-pane"):
+                self.chat = ChatPane(id="chat-scroll")
+                yield self.chat
+                with Container(id="input-row"):
+                    self.input = Input(placeholder="พิมพ์ข้อความ หรือ /help …",
+                                       id="prompt-input")
+                    yield self.input
+            # ── Right: monitor (stats + event log) ───────────────────────
+            with Container(id="monitor-pane"):
+                yield Label("📊 Monitor", classes="pane-title")
+                self.stats_widget = Static("(loading…)", id="stats")
+                yield self.stats_widget
+                yield Label("📜 Events", classes="pane-title")
+                self.event_log = RichLog(highlight=True, markup=True,
+                                          wrap=True, id="event-log")
+                yield self.event_log
+                # Expose monitor helper that targets the two widgets above
+                self.monitor = MonitorPane(self.stats_widget, self.event_log)
+        yield Footer()
+
+    def _refresh_session_list(self):
+        self.session_list.clear()
+        for s in self.store.list_sessions(limit=30):
+            self.session_list.append(SessionListItem(s))
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────
+    async def on_mount(self) -> None:
+        self.title = "thmes-pro"
+        self.sub_title = f"session {self.session_id[:8]} · {DEFAULT_MODEL}"
+        self.input.focus()
+        self._refresh_session_list()
+        if getattr(self, "_startup_cleaned", 0):
+            self.monitor.event(f"🧹 cleaned {self._startup_cleaned} empty sessions", "info")
+        self.monitor.event(f"🚀 thmes-pro started · session={self.session_id[:8]}", "ok")
+        self.update_status()
+        # Model load goes through MLX worker (single thread); MCP can use Textual worker
+        def on_model_loaded(result, err):
+            if err:
+                self.call_from_thread(self.monitor.event,
+                    f"✗ model load failed: {err}", "err")
+            else:
+                self.call_from_thread(self.monitor.event,
+                    f"✓ loaded {MODELS[DEFAULT_MODEL]}", "ok")
+                self.call_from_thread(self.update_status)
+        self.mlx_worker.submit(self.mm.load, DEFAULT_MODEL, on_done=on_model_loaded)
+        if MCP_AVAILABLE:
+            self.run_worker(self._load_mcp_async, exclusive=False, thread=True)
+
+    def _load_mcp_async(self) -> None:
+        try:
+            self.mcp_client = SyncMCPClient()
+            n = self.mcp_client.start()
+            self.mcp_tools = self.mcp_client.tools()
+            self.call_from_thread(self.monitor.event,
+                f"🔌 MCP: {n} tools from {len({t['server'] for t in self.mcp_tools})} server(s)",
+                "ok")
+            for t in self.mcp_tools[:6]:
+                self.call_from_thread(self.monitor.event,
+                    f"  · {t['name']}", "info")
+            if len(self.mcp_tools) > 6:
+                self.call_from_thread(self.monitor.event,
+                    f"  · +{len(self.mcp_tools)-6} more", "info")
+        except Exception as e:
+            self.call_from_thread(self.monitor.event,
+                f"✗ MCP load failed: {e}", "err")
+
+    # _load_model_async retired — model loading now goes through self.mlx_worker
+
+    # ── Status display ────────────────────────────────────────────────────
+    def update_status(self):
+        native = MODEL_CONTEXT.get(self.mm.name or DEFAULT_MODEL, 32_000)
+        ctx = measure_context(self.history, self.last_system, self.mm.processor) \
+              if self.mm.processor else {"total_in":0, "history_tokens":0}
+        pct = int(ctx["total_in"] / native * 100) if native else 0
+        self.ctx_pct = pct
+        snap = self.breaker.snapshot()
+        self.breaker_open = sum(1 for s in snap.values() if s["state"] != "closed")
+        self.monitor.update_stats(**{
+            "model":    self.mm.name or "(loading)",
+            "session":  self.session_id[:8],
+            "agent":    self.current_agent or "—",
+            "tools":    "on" if self.tools_on else "off",
+            "auto":     "on" if self.auto_load else "off",
+            "msgs":     len(self.history),
+            "ctx":      f"{ctx['total_in']:,}/{native:,} ({pct}%)",
+            "breakers": f"{self.breaker_open} open" if self.breaker_open else "all closed",
+        })
+        self.sub_title = (f"sess {self.session_id[:8]} · {self.mm.name or '?'} · "
+                          f"{pct}% ctx · {len(self.history)} msg")
+
+    # ── Input handling ────────────────────────────────────────────────────
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        self.input.value = ""
+        if not text: return
+        if text.startswith("/"):
+            await self.handle_slash(text)
+        else:
+            await self.handle_chat(text)
+
+    async def handle_slash(self, line: str):
+        parts = line.split(maxsplit=1)
+        cmd, arg = parts[0].lower(), (parts[1] if len(parts) > 1 else "")
+        if cmd in {"/quit","/exit"}:
+            self.exit()
+        elif cmd == "/help":
+            self.action_show_help()
+        elif cmd == "/clear":
+            self.action_clear_chat()
+        elif cmd == "/new":
+            self.action_new_session()
+        elif cmd == "/agent":
+            if arg in self.agents:
+                self.current_agent = arg
+                self.monitor.event(f"👤 agent set: {arg}", "ok")
+                self.update_status()
+            else:
+                names = ", ".join(sorted(self.agents)[:14])
+                self.monitor.event(f"agents: {names}", "info")
+        elif cmd == "/model":
+            if arg in MODELS:
+                self.mlx_worker.submit(self._switch_model, arg)
+            else:
+                self.monitor.event(f"models: {', '.join(MODELS)}", "info")
+        elif cmd == "/tools":
+            self.tools_on = not self.tools_on
+            self.monitor.event(f"🔧 tools {'ON' if self.tools_on else 'OFF'}", "warn")
+            self.update_status()
+        elif cmd == "/goal":
+            if not self.goals:
+                self.monitor.event("goals queue unavailable", "warn"); return
+            sub = arg.split(maxsplit=2)
+            action = sub[0] if sub else "list"
+            if action == "add" and len(sub) >= 2:
+                # /goal add [--priority=high] [--review] <goal text>
+                rest = " ".join(sub[1:])
+                priority = "normal"; with_review = False
+                for tag, prio in [("--critical","critical"),("--high","high"),
+                                   ("--normal","normal"),("--low","low")]:
+                    if tag in rest:
+                        priority = prio; rest = rest.replace(tag,"").strip()
+                if "--review" in rest:
+                    with_review = True; rest = rest.replace("--review","").strip()
+                gid = self.goals.add(rest, priority=priority, with_review=with_review)
+                self.monitor.event(f"📌 goal {gid[:8]} queued [{priority}]: {rest[:60]}", "ok")
+            elif action == "list":
+                status = sub[1] if len(sub) > 1 else None
+                rows = self.goals.list(status=status, limit=20)
+                if not rows:
+                    self.monitor.event("(no goals)", "info"); return
+                for r in rows:
+                    color = {"completed":"ok","failed":"err","running":"warn",
+                             "queued":"info","cancelled":"warn"}.get(r["status"],"info")
+                    self.monitor.event(
+                        f"  {r['id'][:8]} [{r['priority']}] [{r['status']}] "
+                        f"{r['goal'][:50]}", color)
+            elif action == "status":
+                stats = self.goals.stats()
+                self.monitor.event(f"📊 queue: {stats}", "info")
+            elif action == "cancel" and len(sub) >= 2:
+                if self.goals.cancel(sub[1]):
+                    self.monitor.event(f"✓ cancelled {sub[1][:8]}", "ok")
+                else:
+                    self.monitor.event(f"could not cancel {sub[1][:8]}", "warn")
+            elif action == "show" and len(sub) >= 2:
+                g = self.goals.get(sub[1])
+                if not g: self.monitor.event(f"not found: {sub[1]}", "warn"); return
+                for k in ["goal","priority","status","retries","created_at",
+                          "started_at","finished_at","result","error"]:
+                    if g.get(k):
+                        self.monitor.event(f"  {k}: {str(g[k])[:80]}", "info")
+            elif action == "daemon":
+                # /goal daemon [start|stop|status]
+                act = sub[1] if len(sub) > 1 else "status"
+                import subprocess
+                if act == "start":
+                    p = subprocess.Popen(
+                        [str(Path.home() / ".local/bin/thmes-daemon")],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True)
+                    self.monitor.event(f"🚀 daemon started pid={p.pid}", "ok")
+                elif act == "stop":
+                    r = subprocess.run(
+                        [str(Path.home() / ".local/bin/thmes-daemon"), "--stop"],
+                        capture_output=True, text=True)
+                    self.monitor.event(r.stdout.strip() or "(no output)", "info")
+                elif act == "status":
+                    r = subprocess.run(
+                        [str(Path.home() / ".local/bin/thmes-daemon"), "--status"],
+                        capture_output=True, text=True)
+                    for line in r.stdout.strip().splitlines():
+                        self.monitor.event(f"  {line}", "info")
+            else:
+                self.monitor.event(
+                    "usage: /goal [add [--priority] [--review] TEXT | list [STATUS] | "
+                    "status | cancel ID | show ID | daemon start|stop|status]", "warn")
+        elif cmd == "/orchestrate":
+            if not ORCH_AVAILABLE or not self.orch_store:
+                self.monitor.event("orchestrator unavailable", "warn"); return
+            if not arg:
+                # List recent runs
+                runs = self.orch_store.list_runs(limit=10)
+                if not runs:
+                    self.monitor.event("no orchestration runs yet", "info")
+                for r in runs:
+                    color = {"completed":"ok","failed":"err","running":"warn",
+                             "planning":"info"}.get(r["status"],"info")
+                    self.monitor.event(
+                        f"  {r['id'][:8]} [{r['status']}] {r['goal'][:50]} "
+                        f"({r['completed_steps']}/{r['total_steps']})", color)
+                return
+            # Run orchestration in worker
+            with_review = "--review" in arg
+            goal = arg.replace("--review","").strip()
+            self.chat.append_user(f"/orchestrate {goal}{' (with review)' if with_review else ''}")
+            self.mlx_worker.submit(self._orchestrate, goal, with_review)
+        elif cmd == "/memory":
+            if not self.memory:
+                self.monitor.event("memory subsystem unavailable", "warn"); return
+            sub = arg.split(maxsplit=2)
+            if not sub or sub[0] == "stats":
+                s = self.memory.stats()
+                self.monitor.event(f"📚 memory: {s['total']} entries  emb:{s['with_embeddings']}", "ok")
+                for tier, n in s["per_tier"].items():
+                    self.monitor.event(f"  · {tier}: {n}", "info")
+            elif sub[0] == "list":
+                tier = sub[1] if len(sub) > 1 else None
+                rows = self.memory.list(tier=tier, limit=20)
+                for r in rows[:10]:
+                    self.monitor.event(f"  [{r['tier']}] {r['key']}: {r['content'][:50]}", "info")
+            elif sub[0] == "store" and len(sub) >= 3:
+                # /memory store KEY VALUE
+                key = sub[1]; value = sub[2]
+                mid = self.memory.store("L3", "global", key, value,
+                                         embed=self._embedding_loaded)
+                self.monitor.event(f"✓ stored {key} ({mid[:8]})", "ok")
+            elif sub[0] == "recall" and len(sub) >= 2:
+                query = sub[1] if len(sub) == 2 else " ".join(sub[1:])
+                if self._embedding_loaded:
+                    rows = self.memory.recall_semantic(query, top_k=5)
+                else:
+                    rows = self.memory.recall_fts(query, limit=5)
+                self.monitor.event(f"🔍 '{query}' → {len(rows)} hits", "info")
+                for r in rows:
+                    sim = r.get("_similarity")
+                    sim_str = f" sim={sim:.2f}" if sim is not None else ""
+                    self.monitor.event(f"  [{r['tier']}]{sim_str} {r['key']}: {r['content'][:50]}", "info")
+            elif sub[0] == "embed-on":
+                # Lazy-load embedding model — needs MLX worker thread
+                self.mlx_worker.submit(self._load_embeddings)
+            elif sub[0] == "delete" and len(sub) >= 2:
+                if self.memory.delete(sub[1], scope="global"):
+                    self.monitor.event(f"✓ deleted {sub[1]}", "ok")
+                else:
+                    self.monitor.event(f"not found: {sub[1]}", "warn")
+            else:
+                self.monitor.event("usage: /memory [stats|list [tier]|store KEY VAL|recall Q|embed-on|delete KEY]", "warn")
+        elif cmd == "/mcp":
+            if not self.mcp_tools:
+                self.monitor.event("MCP not loaded / no tools", "warn"); return
+            sub = arg.split(maxsplit=1)
+            if sub and sub[0] == "call" and len(sub) > 1:
+                # /mcp call <qualified> <json_args>
+                parts = sub[1].split(maxsplit=1)
+                qn = parts[0]
+                try:
+                    args_d = json.loads(parts[1]) if len(parts) > 1 else {}
+                except json.JSONDecodeError:
+                    self.monitor.event(f"bad JSON args: {parts[1] if len(parts)>1 else ''}", "err"); return
+                self.run_worker(lambda: self._call_mcp_tool(qn, args_d), thread=True)
+            else:
+                # list
+                by_server: dict = {}
+                for t in self.mcp_tools:
+                    by_server.setdefault(t["server"], []).append(t)
+                for srv, tools in by_server.items():
+                    self.monitor.event(f"[bold]{srv}[/] ({len(tools)} tools)", "info")
+                    for t in tools[:5]:
+                        self.monitor.event(f"  · {t['tool']}: {t['description'][:50]}", "info")
+                    if len(tools) > 5:
+                        self.monitor.event(f"  · +{len(tools)-5} more", "info")
+        elif cmd == "/opencode":
+            from thmes_core import _FLAGS as flags
+            if arg in {"on","enable","1","true"}:
+                flags["opencode_enabled"] = True
+                self.monitor.event("✓ opencode delegation ON", "ok")
+            elif arg in {"off","disable","0","false"}:
+                flags["opencode_enabled"] = False
+                self.monitor.event("✓ opencode delegation OFF (model uses direct tools)", "warn")
+            else:
+                state = "ON" if flags["opencode_enabled"] else "OFF"
+                self.monitor.event(f"opencode: {state}  (usage: /opencode on|off)", "info")
+        elif cmd == "/breakers":
+            snap = self.breaker.snapshot()
+            if not snap: self.monitor.event("no breaker data yet", "info")
+            else:
+                for n, s in snap.items():
+                    self.monitor.event(f"{n}: {s['state']} ({s['total_fails']}/{s['total_calls']})", "info")
+        else:
+            self.monitor.event(f"unknown command: {cmd}", "warn")
+
+    def _orchestrate(self, goal: str, with_review: bool):
+        """Worker: run multi-step orchestration with live event streaming."""
+        if not self.mm.processor:
+            self.call_from_thread(self.monitor.event, "model not loaded yet", "warn"); return
+
+        def gen(prompt: str, max_tokens: int = 600) -> str:
+            """Wrap mlx-vlm generate for plan-style single-shot."""
+            from mlx_vlm import generate
+            from mlx_vlm.prompt_utils import apply_chat_template
+            formatted = apply_chat_template(
+                self.mm.processor, self.mm.model.config, prompt, num_images=0)
+            r = generate(self.mm.model, self.mm.processor, formatted,
+                         max_tokens=max_tokens, verbose=False)
+            return r.text if hasattr(r, "text") else str(r)
+
+        def exec_step(agent_name: str, message: str) -> tuple[str, bool]:
+            """Execute one step via opencode (preferred) or direct prompt."""
+            agent_cfg = self.agents.get(agent_name, {})
+            # If agent is an executor + opencode available, delegate
+            if agent_cfg.get("role") == "executor" and "opencode" in TOOLS:
+                try:
+                    result = TOOLS["opencode"]["fn"](
+                        prompt=message, agent=agent_name, cwd=str(Path.home()))
+                    ok = "[opencode exit 0" in result or (
+                        "[opencode" not in result.split("\n")[-1])
+                    return result[:5000], ok
+                except Exception as e:
+                    return f"opencode error: {e}", False
+            # Otherwise: run as ReAct turn with the agent's persona
+            try:
+                system = agent_cfg.get("system", "")
+                prompt = f"[Task]\n{message}"
+                if system:
+                    prompt = f"[System]\n{system[:1500]}\n\n{prompt}"
+                out = gen(prompt, max_tokens=1024)
+                return out[:5000], True
+            except Exception as e:
+                return f"exec error: {e}", False
+
+        def on_evt(et: str, data: dict):
+            if et == "plan_start":
+                self.call_from_thread(self.monitor.event,
+                    f"🎼 planning: {data['goal'][:60]}", "info")
+            elif et == "steps_planned":
+                self.call_from_thread(self.monitor.event,
+                    f"📋 plan: {data['count']} steps", "ok")
+                for s in data["steps"]:
+                    self.call_from_thread(self.monitor.event,
+                        f"  · {s['agent']}: {s['message'][:50]}", "info")
+            elif et == "step_start":
+                self.call_from_thread(self.monitor.event,
+                    f"▶ step {data['step']}/{data['total']} @ {data['agent']}", "tool")
+            elif et == "step_done":
+                self.call_from_thread(self.monitor.event,
+                    f"  ✓ step {data['step']} ({data['duration_ms']}ms)", "ok")
+                self.call_from_thread(self.chat.append_tool,
+                    f"step{data['step']}", {}, data["output_preview"], True)
+            elif et == "step_retry":
+                self.call_from_thread(self.monitor.event,
+                    f"  ↻ retry step {data['step']} (attempt {data['attempt']})", "warn")
+            elif et == "step_failed":
+                self.call_from_thread(self.monitor.event,
+                    f"  ✗ step {data['step']} failed: {data.get('error','?')[:60]}", "err")
+            elif et == "review_start":
+                self.call_from_thread(self.monitor.event, "👁 reviewing…", "info")
+            elif et == "review_done":
+                self.call_from_thread(self.monitor.event,
+                    f"👁 review: {data['review'][:80]}", "ok")
+            elif et == "run_finished":
+                color = "ok" if data["status"] == "completed" else "err"
+                self.call_from_thread(self.monitor.event,
+                    f"🏁 run {data['run_id'][:8]}: {data['status']} "
+                    f"({data['completed']}/{data['total']})", color)
+                if NOTIFY_AVAILABLE:
+                    thmes_notify.notify_orchestration_done(
+                        data['run_id'], data['status'],
+                        data['completed'], data['total'])
+            elif et == "run_failed":
+                self.call_from_thread(self.monitor.event,
+                    f"✗ run failed [{data.get('phase','?')}]: {data.get('error','?')[:80]}",
+                    "err")
+
+        try:
+            orch = Orchestrator(self.agents, gen, exec_step,
+                                 store=self.orch_store, on_event=on_evt)
+            result = orch.run(goal, with_review=with_review)
+            # Summary in chat
+            summary_lines = [
+                f"## 🎼 Orchestration `{result['id'][:8]}`",
+                f"**Status:** {result['status']}  "
+                f"**Steps:** {result['completed_steps']}/{result['total_steps']}",
+                "",
+                "### Steps",
+            ]
+            for s in result["steps"]:
+                icon = "✓" if s["status"] == "done" else "✗"
+                summary_lines.append(
+                    f"{icon} **{s['step_num']}.** [{s['agent']}] {s['message'][:80]}")
+            self.call_from_thread(self.chat.append_assistant, "\n".join(summary_lines))
+        except Exception as e:
+            import traceback
+            self.call_from_thread(self.monitor.event,
+                f"✗ orchestrator: {type(e).__name__}: {e}", "err")
+            self.call_from_thread(self.chat.append_system,
+                f"Orchestration failed: {e}\n{traceback.format_exc()[:500]}")
+
+    def _load_embeddings(self):
+        """Worker: load the embedding model into memory service."""
+        if not self.memory:
+            self.call_from_thread(self.monitor.event, "memory disabled", "warn"); return
+        self.call_from_thread(self.monitor.event,
+            "📚 loading embedding model (first time = download)…", "info")
+        emb = EmbeddingEngine()
+        if emb.load():
+            self.memory.embed = emb
+            self._embedding_loaded = True
+            self.call_from_thread(self.monitor.event,
+                f"✓ embedding model ready (dim={emb.dim})", "ok")
+        else:
+            self.call_from_thread(self.monitor.event,
+                "✗ embedding model failed to load", "err")
+
+    def _call_mcp_tool(self, qn: str, args: dict):
+        """Worker: invoke MCP tool and show result in chat + monitor."""
+        if not self.mcp_client:
+            self.call_from_thread(self.monitor.event, "MCP client not available", "err"); return
+        try:
+            result = self.mcp_client.call(qn, args)
+            self.call_from_thread(self.chat.append_tool, qn, args, result, True)
+            self.call_from_thread(self.monitor.event, f"✓ {qn} → {result[:80]}", "ok")
+        except Exception as e:
+            self.call_from_thread(self.chat.append_tool, qn, args, str(e), False)
+            self.call_from_thread(self.monitor.event, f"✗ {qn}: {e}", "err")
+
+    def _switch_model(self, name: str):
+        self.mm.load(name)
+        if REGISTRY_AVAILABLE:
+            try:
+                get_registry().set_current_model(name, who="tui")
+            except Exception: pass
+        self.call_from_thread(self.monitor.event,
+            f"📦 switched to {name} (registry updated)", "ok")
+        self.call_from_thread(self.update_status)
+
+    # ── Chat (worker thread) ──────────────────────────────────────────────
+    async def handle_chat(self, msg: str):
+        self.chat.append_user(msg)
+        self.history.append({"role": "user", "content": msg})
+        self.store.add_message(self.session_id, "user", msg)
+        if self.session_first_msg:
+            self.store.update_title(self.session_id, msg[:80])
+            self.session_first_msg = False
+            self._refresh_session_list()
+        self.monitor.event(f"📨 user: {msg[:60]}", "info")
+        # Generation MUST run on the MLX worker thread (Metal stream affinity)
+        self.mlx_worker.submit(self._generate, msg, on_done=self._on_generate_done)
+
+    def _on_generate_done(self, result, err):
+        if err:
+            import traceback
+            tb = traceback.format_exc()
+            self.call_from_thread(self.monitor.event,
+                f"✗ generation: {type(err).__name__}: {err}", "err")
+            self.call_from_thread(self.chat.append_system,
+                f"Error: {err}\n{tb[:400]}")
+
+    def _generate(self, user_msg: str):
+        """Run agentic turn with token streaming + live tool call cards."""
+        import re
+        from mlx_vlm import stream_generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+        try:
+            t0 = time.time()
+
+            # ── Smart routing ────────────────────────────────────────────
+            chosen_tools = TOOLS if self.tools_on else {}
+            chosen_skills_idx = []
+            chosen_agent = self.current_agent
+            if self.auto_load and self.tools_on:
+                sel = smart_route(user_msg, self.agents, self.skills)
+                if sel:
+                    chosen_tools = {k: v for k, v in TOOLS.items() if k in sel["tools"]}
+                    chosen_skills_idx = sel["skills"]
+                    if sel["agent"]: chosen_agent = sel["agent"]
+                    self.call_from_thread(self.monitor.event,
+                        f"🧠 routed: tools={sel['tools'] or '—'} "
+                        f"agent={sel['agent'] or '—'} skills={sel['skills'] or '—'}",
+                        "info")
+
+            agent_desc = ""
+            if chosen_agent: agent_desc = self.agents[chosen_agent]["system"]
+            system_full = tools_system_block(chosen_tools, chosen_skills_idx, agent_desc,
+                                             profile=core._detect_model_profile(self.mm))
+            self.last_system = system_full
+
+            # ── Agentic loop with streaming per iteration ────────────────
+            max_iters = 4
+            total_tokens = 0
+            total_tool_calls = 0
+            final_reply = ""
+            known_tools = set(TOOLS.keys())
+
+            for it in range(max_iters):
+                # Serialize the full conversation so the model sees prior tool
+                # results + the original question — not just the latest message.
+                # mlx_vlm's apply_chat_template takes one prompt string, so we
+                # role-tag each turn and concatenate. (See same fix in
+                # thmes's _stringify_history_for_vlm.)
+                parts = []
+                if system_full:
+                    parts.append(f"[System]\n{system_full}")
+                for h in self.history:
+                    role = h.get("role", "user")
+                    label = ("User" if role == "user"
+                             else "Assistant" if role == "assistant"
+                             else role.title())
+                    parts.append(f"[{label}]\n{h.get('content','')}")
+                parts.append("[Assistant]\n")
+                msg_text = "\n\n".join(parts)
+                formatted = apply_chat_template(
+                    self.mm.processor, self.mm.model.config, msg_text, num_images=0)
+
+                # Stream tokens
+                stream_widget = None
+                accumulated = ""
+                self.call_from_thread(self.monitor.event,
+                    f"⚡ iter {it+1}/{max_iters} streaming…", "tool")
+
+                for chunk in stream_generate(
+                        self.mm.model, self.mm.processor, formatted,
+                        max_tokens=DEFAULT_MAX_TOKENS, verbose=False):
+                    # chunk may be a string token or GenerationResponse
+                    token = chunk.text if hasattr(chunk, "text") else str(chunk)
+                    accumulated += token
+                    total_tokens += 1
+                    if stream_widget is None:
+                        stream_widget = self.call_from_thread(self.chat.begin_stream)
+                    # Update display every ~4 tokens for smoothness
+                    if total_tokens % 4 == 0:
+                        self.call_from_thread(stream_widget.update, accumulated[-3000:])
+
+                # Final update
+                if stream_widget:
+                    self.call_from_thread(stream_widget.update, accumulated)
+
+                self.history.append({"role": "assistant", "content": accumulated})
+
+                # ── Parse tool calls ─────────────────────────────────────
+                calls, notes = parse_tool_calls(accumulated, known_tools=known_tools)
+                if not calls or not self.tools_on:
+                    final_reply = accumulated
+                    break
+
+                # Execute each tool, show card in chat
+                for c in calls:
+                    total_tool_calls += 1
+                    name = c.get("name", "?")
+                    args = c.get("arguments", {}) or {}
+                    self.call_from_thread(self.monitor.event,
+                        f"🔧 {name}({json.dumps(args, ensure_ascii=False)[:80]})", "tool")
+                    # Execute
+                    if name in TOOLS:
+                        try:
+                            result = str(TOOLS[name]["fn"](**args))
+                            ok = True
+                            self.breaker.record_success(name)
+                        except Exception as e:
+                            result = f"Tool error: {type(e).__name__}: {e}"
+                            ok = False
+                            self.breaker.record_failure(name)
+                    else:
+                        result = f"Unknown tool: {name}"
+                        ok = False
+                    # Show card
+                    self.call_from_thread(self.chat.append_tool, name, args, result, ok)
+                    self.call_from_thread(self.monitor.event,
+                        f"{'✓' if ok else '✗'} {name} → {result[:80]}",
+                        "ok" if ok else "err")
+                    # Feed result back into history
+                    self.history.append({
+                        "role": "user",
+                        "content": f"<tool_result name=\"{name}\">\n{result}\n</tool_result>"
+                    })
+
+            elapsed = time.time() - t0
+            self.call_from_thread(self.monitor.event,
+                f"✓ done {total_tokens}tok {elapsed:.1f}s ({total_tool_calls} tools)",
+                "ok")
+            # Persist
+            clean = re.sub(r"<tool_call>.*?</tool_call>", "", final_reply,
+                           flags=re.DOTALL).strip()
+            self.store.add_message(self.session_id, "assistant",
+                                    clean[:5000] or final_reply[:5000],
+                                    tokens=total_tokens)
+            self.call_from_thread(self.update_status)
+            # Desktop notification for long-running generations
+            if NOTIFY_AVAILABLE and elapsed >= 30:
+                thmes_notify.notify_done("response ready", elapsed,
+                                          summary=clean[:80])
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.call_from_thread(self.monitor.event, f"✗ {type(e).__name__}: {e}", "err")
+            self.call_from_thread(self.chat.append_system, f"Error: {e}\n{tb[:500]}")
+
+    # ── Actions ───────────────────────────────────────────────────────────
+    def action_clear_chat(self):
+        self.history.clear()
+        # Reset chat pane
+        for child in list(self.chat.children):
+            child.remove()
+        self.monitor.event("🧹 chat cleared", "warn")
+        self.update_status()
+
+    def action_new_session(self):
+        # Auto-archive if current is empty
+        sess = self.store.get_session(self.session_id)
+        if sess and sess["message_count"] == 0:
+            self.store.archive(self.session_id)
+        self.session_id = self.store.create_session(model=self.mm.name or DEFAULT_MODEL,
+                                                    agent=self.current_agent)
+        self.session_first_msg = True
+        self.history.clear()
+        for child in list(self.chat.children): child.remove()
+        self._refresh_session_list()
+        self.monitor.event(f"📂 new session: {self.session_id[:8]}", "ok")
+        self.update_status()
+
+    def action_refresh_sessions(self):
+        self._refresh_session_list()
+        self.monitor.event("🔄 sessions refreshed", "info")
+
+    def action_screen_redraw(self):
+        """Force a full screen redraw — clears scrollback artifacts."""
+        self.refresh()
+        for w in self.query("*"):
+            try: w.refresh()
+            except Exception: pass
+        self.monitor.event("🖥  screen redrawn", "info")
+
+    def action_toggle_sessions_pane(self):
+        pane = self.query_one("#sessions-pane")
+        pane.toggle_class("hidden")
+        state = "hidden" if pane.has_class("hidden") else "visible"
+        self.monitor.event(f"📂 sessions {state}", "info")
+
+    def action_toggle_monitor_pane(self):
+        pane = self.query_one("#monitor-pane")
+        pane.toggle_class("hidden")
+        state = "hidden" if pane.has_class("hidden") else "visible"
+        self.monitor.event(f"📊 monitor {state}", "info")
+
+    def on_resize(self, event):
+        """Auto-hide sidebars on narrow terminals."""
+        w = event.size.width
+        sess = self.query_one("#sessions-pane")
+        mon  = self.query_one("#monitor-pane")
+        # On narrow terms (<80 cols), hide monitor; <60 cols hide both
+        if w < 60:
+            if not sess.has_class("hidden"): sess.add_class("hidden")
+            if not mon.has_class("hidden"):  mon.add_class("hidden")
+        elif w < 80:
+            if not mon.has_class("hidden"):  mon.add_class("hidden")
+        # On wider, restore (user can still manually toggle after)
+
+    def action_toggle_tools(self):
+        self.tools_on = not self.tools_on
+        self.monitor.event(f"🔧 tools {'ON' if self.tools_on else 'OFF'}", "warn")
+        self.update_status()
+
+    def action_show_help(self):
+        helps = [
+            ("Ctrl+D",  "Quit"),
+            ("Ctrl+L",  "Clear chat (keep session)"),
+            ("Ctrl+N",  "New session"),
+            ("Ctrl+R",  "Refresh sessions list"),
+            ("F1",      "Show this help"),
+            ("F2",      "Toggle tools on/off"),
+            ("/agent NAME",   "Switch persona"),
+            ("/model NAME",   "Switch model"),
+            ("/tools",        "Toggle tools"),
+            ("/opencode on|off", "Toggle opencode delegation (off = Qwen solo)"),
+            ("/mcp [list|call QN JSON]", "MCP tools"),
+            ("/breakers",     "Show breaker status"),
+            ("/new",          "New session"),
+            ("/clear",        "Clear chat"),
+            ("/quit",         "Exit"),
+        ]
+        for k, v in helps:
+            self.monitor.event(f"[bold cyan]{k}[/] [dim]{v}[/]", "info")
+
+    # ── Session click handler ─────────────────────────────────────────────
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        item = event.item
+        if not isinstance(item, SessionListItem): return
+        target_id = item.session["id"]
+        if target_id == self.session_id: return
+        # Auto-archive empty current
+        cur = self.store.get_session(self.session_id)
+        if cur and cur["message_count"] == 0:
+            self.store.archive(self.session_id)
+        self.session_id = target_id
+        loaded = self.store.load_messages(target_id)
+        self.history.clear(); self.history.extend(loaded)
+        # Clear and rebuild chat
+        for child in list(self.chat.children): child.remove()
+        for m in loaded:
+            if m["role"] == "user": self.chat.append_user(m["content"])
+            elif m["role"] == "assistant": self.chat.append_assistant(m["content"])
+        self.session_first_msg = False
+        sess = self.store.get_session(target_id)
+        if sess["model"] and sess["model"] in MODELS and sess["model"] != self.mm.name:
+            self.run_worker(lambda: self._switch_model(sess["model"]), thread=True)
+        self.monitor.event(f"📂 resumed {target_id[:8]} ({len(loaded)} msgs)", "ok")
+        self.update_status()
+
+
+if __name__ == "__main__":
+    ThmesProApp().run()

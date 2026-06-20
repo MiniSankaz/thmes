@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Usage: hermes-use {gemma|qwen|qwen3}
+case "$1" in
+  gemma)
+    ~/.local/bin/hermes config set model.default "mlx-community/gemma-4-e4b-it-4bit"
+    ~/.local/bin/hermes config set model.base_url "http://127.0.0.1:8081/v1"
+    ~/.local/bin/hermes config set model.provider "lmstudio"
+    echo "→ Hermes now uses Gemma 4 e4b (port 8081)" ;;
+  qwen)
+    ~/.local/bin/hermes config set model.default "mlx-community/Qwen3-VL-8B-Instruct-4bit"
+    ~/.local/bin/hermes config set model.base_url "http://127.0.0.1:8080/v1"
+    ~/.local/bin/hermes config set model.provider "lmstudio"
+    echo "→ Hermes now uses Qwen3-VL 8B (port 8080)" ;;
+  qwen3)
+    ~/.local/bin/hermes config set model.default "mlx-community/Qwen3-8B-4bit"
+    ~/.local/bin/hermes config set model.base_url "http://127.0.0.1:8082/v1"
+    ~/.local/bin/hermes config set model.provider "lmstudio"
+    echo "→ Hermes now uses Qwen3 8B text (port 8082)" ;;
+  *) echo "Usage: hermes-use {gemma|qwen|qwen3}"; exit 1 ;;
+esac

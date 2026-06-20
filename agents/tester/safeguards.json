@@ -1,0 +1,14 @@
+{
+  "permission": {
+    "edit": "allow",
+    "write": "allow",
+    "bash": "ask"
+  },
+  "hard_limits": [
+    "Always test before committing",
+    "Preserve existing tests/behavior",
+    "Ask before destructive operations (rm, force-push, drop table)"
+  ],
+  "max_iterations": 5,
+  "max_tool_calls_per_turn": 8
+}

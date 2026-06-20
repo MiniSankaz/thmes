@@ -1,0 +1,14 @@
+{
+  "permission": {
+    "edit": "deny",
+    "write": "deny",
+    "bash": "ask"
+  },
+  "hard_limits": [
+    "Never modify code without explicit approval",
+    "Always cite sources or assumptions",
+    "Flag ambiguity in requirements"
+  ],
+  "max_iterations": 5,
+  "max_tool_calls_per_turn": 8
+}

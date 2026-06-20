@@ -1,0 +1,6 @@
+{
+  "model_preference": "gemma",
+  "temperature": 0.2,
+  "max_tokens": 2048,
+  "auto_compact": true
+}

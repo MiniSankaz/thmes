@@ -1,0 +1,14 @@
+{
+  "permission": {
+    "edit": "deny",
+    "write": "deny",
+    "bash": "ask"
+  },
+  "hard_limits": [
+    "Read-only: never edit code directly",
+    "Provide constructive feedback only",
+    "Suggest improvements, don't impose"
+  ],
+  "max_iterations": 5,
+  "max_tool_calls_per_turn": 8
+}

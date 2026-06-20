@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | sed -n '2p')
+          CURR_TAG="${{ github.ref_name }}"
+          echo "## What's changed in ${CURR_TAG}" > CHANGES.md
+          echo "" >> CHANGES.md
+          if [ -n "$PREV_TAG" ]; then
+            git log "${PREV_TAG}..HEAD" --oneline --no-merges \
+              --pretty=format:"- %s" >> CHANGES.md
+            echo "" >> CHANGES.md
+            echo "**Full diff:** [\`${PREV_TAG}..${CURR_TAG}\`](${{ github.server_url }}/${{ github.repository }}/compare/${PREV_TAG}...${CURR_TAG})" >> CHANGES.md
+          else
+            git log --oneline --no-merges --pretty=format:"- %s" >> CHANGES.md
+          fi
+          cat CHANGES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "THMES ${{ github.ref_name }}"
+          body_path: CHANGES.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

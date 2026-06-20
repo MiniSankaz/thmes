@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# gemma — direct MLX CLI for Gemma 4 e4b (text + image + audio).
+#
+# Usage:
+#   gemma "prompt"                          # text
+#   gemma -i path/to/image.jpg "prompt"     # image + text
+#   gemma -a path/to/audio.wav  "prompt"    # audio + text
+#   gemma -i img.jpg -a snd.wav "prompt"    # image + audio + text
+#   gemma --chat                            # interactive REPL
+#   gemma --server [--port 8081]            # start OpenAI-compatible server
+#   echo "prompt" | gemma -                 # read prompt from stdin
+#
+# Examples:
+#   gemma "สรุปข่าวเทคโนโลยีประจำสัปดาห์"
+#   gemma -i screenshot.png "อ่านข้อความในรูปและแปลเป็นไทย"
+#   gemma -a meeting.wav "ถอดเสียงและสรุปประเด็นสำคัญ"
+
+set -e
+
+MODEL="mlx-community/gemma-4-e4b-it-4bit"
+PY="$HOME/.mlx-env/bin/python"
+MAX_TOKENS="${GEMMA_MAX_TOKENS:-512}"
+
+# ── Mode flags ──────────────────────────────────────────────────────────────
+IMAGE=""
+AUDIO=""
+PROMPT=""
+CHAT_MODE=0
+SERVER_MODE=0
+PORT=8081
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i|--image)  IMAGE="$2"; shift 2 ;;
+    -a|--audio)  AUDIO="$2"; shift 2 ;;
+    -m|--max)    MAX_TOKENS="$2"; shift 2 ;;
+    --chat)      CHAT_MODE=1; shift ;;
+    --server)    SERVER_MODE=1; shift ;;
+    --port)      PORT="$2"; shift 2 ;;
+    --model)     MODEL="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,/^set -e/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'
+      exit 0 ;;
+    -)           PROMPT="$(cat)"; shift ;;
+    *)           PROMPT="$1"; shift ;;
+  esac
+done
+
+# ── Server mode ─────────────────────────────────────────────────────────────
+if [ "$SERVER_MODE" = 1 ]; then
+  echo "Starting MLX-VLM server: $MODEL on :$PORT" >&2
+  exec "$PY" -m mlx_vlm.server --model "$MODEL" --host 127.0.0.1 --port "$PORT"
+fi
+
+# ── Chat mode (interactive REPL) ────────────────────────────────────────────
+if [ "$CHAT_MODE" = 1 ]; then
+  exec "$PY" -m mlx_vlm.chat --model "$MODEL" --max-tokens "$MAX_TOKENS"
+fi
+
+# ── One-shot generation ─────────────────────────────────────────────────────
+[ -z "$PROMPT" ] && { echo "error: no prompt (use -h for help)" >&2; exit 2; }
+
+ARGS=(--model "$MODEL" --prompt "$PROMPT" --max-tokens "$MAX_TOKENS")
+[ -n "$IMAGE" ] && ARGS+=(--image "$IMAGE")
+[ -n "$AUDIO" ] && ARGS+=(--audio "$AUDIO")
+
+exec "$PY" -m mlx_vlm.generate "${ARGS[@]}"

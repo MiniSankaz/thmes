@@ -1,0 +1,244 @@
+#!/usr/bin/env -S /Users/semini/.mlx-env/bin/python
+"""thmes-daemon — Background worker process for autonomous goals.
+
+Polls ~/.thmes/data/goals.db, picks up queued goals, runs them via the
+orchestrator (Gemma planner + opencode executor), then notifies the user
+via macOS notification.
+
+Usage:
+  thmes-daemon                  # foreground
+  thmes-daemon &                # background
+  pkill -f thmes-daemon         # stop
+
+PID file: ~/.thmes/data/daemon.pid
+Log:     ~/.thmes/data/daemon.log
+"""
+from __future__ import annotations
+import argparse
+import importlib.util
+import importlib.machinery
+import os
+import signal
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# Make lib/ importable. Prefer the repo's own lib/ (sibling of bin/, so edits
+# take effect in-place via the symlink/wrapper), then installed share dirs.
+sys.path.insert(0, str(Path.home() / ".local/share/thmes"))
+_PROJ_LIB = Path(__file__).resolve().parent.parent / "lib"
+if _PROJ_LIB.is_dir():
+    sys.path.insert(0, str(_PROJ_LIB))
+
+# Data home — migrate a pre-existing ~/.gemma-tui (old project name) once.
+_THMES_DATA = Path.home() / ".thmes"
+_LEGACY_DATA = Path.home() / ".gemma-tui"
+if _LEGACY_DATA.exists() and not _THMES_DATA.exists():
+    try:
+        _LEGACY_DATA.rename(_THMES_DATA)
+    except Exception:
+        _THMES_DATA = _LEGACY_DATA
+
+# Lazy-import these — they pull in MLX which is heavy
+def _import_core():
+    for candidate in [
+        Path(__file__).resolve().parent / "thmes",   # repo sibling = real Python source
+        Path.home() / ".local/bin/thmes",
+    ]:
+        # Skip bash wrappers (installed ~/.local/bin/thmes is a wrapper, not the
+        # Python core) — only load a file whose first line is a python shebang.
+        if candidate.exists() and "python" in candidate.read_text(errors="ignore")[:120].split("\n", 1)[0]:
+            spec = importlib.util.spec_from_loader(
+                "thmes_core",
+                importlib.machinery.SourceFileLoader("thmes_core", str(candidate))
+            )
+            core = importlib.util.module_from_spec(spec)
+            sys.modules["thmes_core"] = core
+            spec.loader.exec_module(core)
+            return core
+    raise FileNotFoundError("thmes binary not found in ~/.local/bin/")
+
+
+PID_FILE = _THMES_DATA / "data/daemon.pid"
+LOG_FILE = _THMES_DATA / "data/daemon.log"
+GOALS_DB = _THMES_DATA / "data/goals.db"
+
+
+def log(msg: str, level: str = "info"):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] [{level}] {msg}\n"
+    print(line, end="", flush=True)
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG_FILE, "a") as f:
+        f.write(line)
+
+
+def notify(title: str, body: str, sound: bool = False):
+    """macOS desktop notification via osascript."""
+    safe_title = title.replace('"', '\\"')[:80]
+    safe_body  = body.replace('"', '\\"')[:200]
+    cmd = f'display notification "{safe_body}" with title "{safe_title}"'
+    if sound: cmd += ' sound name "Glass"'
+    os.system(f'osascript -e \'{cmd}\' 2>/dev/null')
+
+
+def write_pid():
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+
+
+def remove_pid():
+    try: PID_FILE.unlink()
+    except FileNotFoundError: pass
+
+
+def check_running() -> int | None:
+    """Return PID if another daemon is running, else None."""
+    if not PID_FILE.exists(): return None
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)  # check alive (no signal sent)
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError):
+        PID_FILE.unlink(missing_ok=True)
+        return None
+
+
+def make_orch_factory():
+    """Factory that creates a fresh Orchestrator per goal."""
+    core = _import_core()
+    from thmes_orchestrator import Orchestrator, OrchestrationStore
+    try:
+        from thmes_registry import get_registry
+        reg = get_registry()
+    except ImportError:
+        reg = None
+
+    # Pick model from registry → falls back to default
+    initial_model = reg.current_model(core.DEFAULT_MODEL) if reg else core.DEFAULT_MODEL
+    mm = core.ModelManager()
+    mm.load(initial_model)
+    agents = core.load_agents()
+    store = OrchestrationStore()
+    log(f"model={mm.name} (from {'registry' if reg else 'default'}) agents={len(agents)}")
+
+    def maybe_hotswap():
+        """Check registry; if active model changed, swap. Cheap (1s cache)."""
+        if not reg: return
+        wanted = reg.current_model(core.DEFAULT_MODEL)
+        if wanted != mm.name and wanted in core.MODELS:
+            log(f"🔄 hot-swap: {mm.name} → {wanted}")
+            mm.load(wanted)
+
+    def gen(prompt: str, max_tokens: int = 600) -> str:
+        from mlx_vlm import generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+        formatted = apply_chat_template(mm.processor, mm.model.config, prompt, num_images=0)
+        r = generate(mm.model, mm.processor, formatted,
+                     max_tokens=max_tokens, verbose=False)
+        return r.text if hasattr(r, "text") else str(r)
+
+    def exec_step(agent_name: str, message: str) -> tuple[str, bool]:
+        agent_cfg = agents.get(agent_name, {})
+        # Always try opencode for executor agents
+        if agent_cfg.get("role") == "executor" and "opencode" in core.TOOLS:
+            try:
+                result = str(core.TOOLS["opencode"]["fn"](
+                    prompt=message, agent=agent_name, cwd=str(Path.home())))
+                ok = "exit 0" in result or "[opencode" not in result.split("\n")[-1]
+                return result[:5000], ok
+            except Exception as e:
+                return f"opencode error: {e}", False
+        # Otherwise: ReAct via small model
+        try:
+            system = agent_cfg.get("system", "")[:1500]
+            prompt = (f"[System]\n{system}\n\n[Task]\n{message}"
+                      if system else f"[Task]\n{message}")
+            return gen(prompt, max_tokens=1024)[:5000], True
+        except Exception as e:
+            return f"exec error: {e}", False
+
+    def factory():
+        # Hot-swap check before each goal
+        maybe_hotswap()
+        return Orchestrator(agents, gen, exec_step, store=store)
+
+    return factory
+
+
+def on_event(evt: str, data: dict):
+    if evt == "worker_start":
+        log(f"🚀 worker started (pid={data['pid']})")
+        notify("thmes-daemon", "Background worker started")
+    elif evt == "goal_start":
+        log(f"▶ goal {data['id'][:8]} [{data['priority']}]: {data['goal'][:80]}")
+    elif evt == "goal_done":
+        log(f"✓ goal {data['id'][:8]} done (run={data.get('run_id','?')[:8]})")
+        notify("thmes-daemon", f"✓ Goal {data['id'][:8]} completed", sound=True)
+    elif evt == "goal_failed":
+        log(f"✗ goal {data['id'][:8]} failed: {data.get('error','?')[:100]}", "error")
+        notify("thmes-daemon", f"✗ Goal {data['id'][:8]} failed", sound=True)
+    elif evt == "goal_retry":
+        log(f"↻ goal {data['id'][:8]} retrying: {data.get('error','?')[:80]}", "warn")
+    elif evt == "worker_stop":
+        log(f"🛑 worker stopping (pid={data['pid']})")
+    elif evt == "worker_error":
+        log(f"⚠ worker error: {data['error']}", "error")
+
+
+def main():
+    p = argparse.ArgumentParser(description="thmes-daemon — autonomous goal worker")
+    p.add_argument("--once", action="store_true", help="process one goal then exit")
+    p.add_argument("--no-notify", action="store_true", help="disable desktop notifications")
+    p.add_argument("--poll", type=float, default=3.0, help="seconds between polls (default 3)")
+    p.add_argument("--status", action="store_true", help="show daemon status + exit")
+    p.add_argument("--stop", action="store_true", help="stop running daemon")
+    args = p.parse_args()
+
+    if args.status:
+        pid = check_running()
+        print(f"daemon: {'RUNNING pid=' + str(pid) if pid else 'NOT RUNNING'}")
+        from thmes_goals import GoalQueue
+        q = GoalQueue()
+        print(f"queue:  {q.stats()}")
+        return
+
+    if args.stop:
+        pid = check_running()
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+            print(f"sent SIGTERM to pid {pid}")
+        else:
+            print("daemon not running")
+        return
+
+    other = check_running()
+    if other:
+        print(f"daemon already running at pid {other}"); sys.exit(1)
+
+    write_pid()
+    try:
+        from thmes_goals import GoalQueue, GoalWorker
+        q = GoalQueue()
+        log(f"poll={args.poll}s notify={'off' if args.no_notify else 'on'}")
+        evt_handler = (lambda e,d: None) if args.no_notify else on_event
+        worker = GoalWorker(q, make_orch_factory(),
+                             poll_interval=args.poll, on_event=evt_handler)
+        # Graceful shutdown on SIGTERM/SIGINT
+        def shutdown(sig, frame):
+            log(f"received signal {sig}, stopping…")
+            worker.stop()
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+        if args.once:
+            had_work = worker.run_one()
+            log(f"--once: {'processed 1 goal' if had_work else 'queue empty'}")
+        else:
+            worker.loop()
+    finally:
+        remove_pid()
+
+
+if __name__ == "__main__":
+    main()

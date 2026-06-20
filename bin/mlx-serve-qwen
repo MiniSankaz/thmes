@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+exec ~/.mlx-env/bin/python -m mlx_vlm.server \
+  --model mlx-community/Qwen3-VL-8B-Instruct-4bit \
+  --host 127.0.0.1 \
+  --port 8080 \
+  "$@"

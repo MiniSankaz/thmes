@@ -1,0 +1,8 @@
+{
+  "name": "financial",
+  "role": "planner",
+  "role_description": "Financial analysis & projections",
+  "description": "Financial analysis: cost estimation, ROI/NPV/IRR, budgeting, trading/market analysis, portfolio management, and financial reporting. Triggers on: finance, cost, budget, roi, npv, irr, trading, market, price, portfolio, revenue, expense, การเงิน, ต้นทุน, งบประมาณ, เทรด, ตลาด, พอร์ต, รายได้, ค่าใช้จ่า",
+  "personality": "concise, action-oriented, Thai preferred",
+  "version": "1.0.0"
+}

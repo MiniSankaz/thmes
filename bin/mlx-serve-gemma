@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Start MLX server with Gemma 4 e4b (text+image+audio+tools)
+exec ~/.mlx-env/bin/python -m mlx_vlm.server \
+  --model mlx-community/gemma-4-e4b-it-4bit \
+  --host 127.0.0.1 \
+  --port 8081 \
+  "$@"

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+exec ~/.mlx-env/bin/python -m mlx_lm.server \
+  --model mlx-community/Qwen3-8B-4bit \
+  --host 127.0.0.1 \
+  --port 8082 \
+  --log-level INFO \
+  "$@"

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# thmes-web — serve the thmes CLI in a browser (PTY + WebSocket + xterm.js).
+#
+#   thmes-web                 # then open http://localhost:8765
+#
+# Needs the `websockets` package in the chosen Python:  pip install websockets
+# Override the interpreter with THMES_WEB_PYTHON if `python3` lacks the package.
+# If the thmes shebang Python isn't on this host, set THMES_CMD, e.g.:
+#   THMES_CMD="$HOME/.thmes-env/bin/python /path/to/repo/bin/thmes" thmes-web
+set -e
+
+# Resolve this script's real location (it is symlinked into ~/.local/bin by install.sh).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+REPO="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"   # repo root (parent of bin/)
+
+PY="${THMES_WEB_PYTHON:-python3}"
+exec "$PY" "$REPO/web/server.py" "$@"
