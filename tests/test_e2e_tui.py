@@ -219,7 +219,10 @@ elif has_wrapper:
     for _n in _WRAPPER_NAMES:
         _w = os.path.expanduser(f"~/.local/bin/{_n}")
         if Path(_w).exists():
-            launch_cmd = _w
+            # Prepend the model IN the command — tmux new-session inherits the tmux
+            # *server's* env, not ours, so an exported THMES_MODEL never reaches the
+            # wrapper (it would default to qwen-vl and fail on an Ollama-only box).
+            launch_cmd = f"THMES_MODEL=ol:gemma4:e4b {_w}"
             break
 else:
     launch_cmd = f"THMES_MODEL=ol:gemma4:e4b {_py} {_find_src(REPO)}"

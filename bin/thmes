@@ -3656,11 +3656,23 @@ def _ensure_ollama(host: str = OLLAMA_HOST, start_wait: float = 5.0) -> bool:
     not on PATH or the port still does not respond, returns False silently so
     callers can fall back gracefully.
     """
-    try:
-        urlopen(Request(f"{host}/api/tags", headers=_ollama_headers()), timeout=2)
+    import socket
+    from urllib.parse import urlparse
+    _u = urlparse(host)
+    _addr = (_u.hostname or "127.0.0.1", _u.port or 11434)
+
+    def _port_open(timeout: float = 3.0) -> bool:
+        # Raw socket connect — true even when Ollama is BUSY (mid model-load/swap,
+        # when the /api/* HTTP surface can lag for many seconds). The port stays open,
+        # so we don't falsely report "unreachable" and abort the model load.
+        try:
+            with socket.create_connection(_addr, timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    if _port_open():
         return True
-    except Exception:
-        pass
     if not shutil.which("ollama"):
         return False
     console.print("[dim]🦙 Ollama not running — starting `ollama serve` …[/]")
@@ -3676,12 +3688,9 @@ def _ensure_ollama(host: str = OLLAMA_HOST, start_wait: float = 5.0) -> bool:
     deadline = time.time() + start_wait
     while time.time() < deadline:
         time.sleep(0.5)
-        try:
-            urlopen(Request(f"{host}/api/tags", headers=_ollama_headers()), timeout=1)
+        if _port_open(timeout=1.0):
             console.print("[green]✓[/] Ollama started")
             return True
-        except Exception:
-            pass
     console.print("[yellow]⚠ Ollama did not respond in time — continuing without it[/]")
     return False
 
@@ -3721,6 +3730,14 @@ def discover_ollama_models(host: str = OLLAMA_HOST, timeout: float = 2.0) -> dic
 
 def _is_ollama_alias(name: str) -> bool:
     return name.startswith("ol:")
+
+
+def _mlx_available() -> bool:
+    """True if an MLX backend (mlx_lm / mlx_vlm) is importable on this machine.
+    Used so we don't default to an MLX model on an Ollama-only box."""
+    import importlib.util
+    return (importlib.util.find_spec("mlx_lm") is not None
+            or importlib.util.find_spec("mlx_vlm") is not None)
 
 
 def _ollama_ps(host: str = OLLAMA_HOST, timeout: float = 2.0) -> dict:
@@ -4360,6 +4377,13 @@ def generate_reply(history, system: str, *, image=None, audio=None, max_tokens=5
     if model:
         return _ollama_chat(history, system, max_tokens, tools=tools, model=model,
                             temperature=temperature, think=think)
+    # No model is loaded (e.g. Ollama was momentarily busy/unreachable at startup,
+    # or an MLX model on a machine without MLX). Don't fall through to the MLX path
+    # and crash with ModuleNotFoundError — fail clean and recoverable.
+    if mm.name is None:
+        return ("[no model loaded — pick one with /model (e.g. /model ol:gemma4:e4b). "
+                "If Ollama was busy at startup, just resend your message.]",
+                {"tokens": 0, "tps": 0, "peak": 0})
     if mm.backend == "ollama":
         if image or audio:
             console.print("[yellow]⚠ image/audio ignored on Ollama backend "
@@ -6378,6 +6402,12 @@ def main():
             console.print(f"[yellow]⚠ THMES_MODEL={DEFAULT_MODEL!r} not found; "
                           f"falling back to first available[/]")
             default_model = next(iter(MODELS), next(iter(OLLAMA_MODELS)))
+
+    # On an Ollama-only machine (no MLX installed) don't default to an MLX model
+    # the user can't load — pressing Enter at the picker would just error. Prefer
+    # the first available Ollama model so the default "just works".
+    if default_model in MODELS and not _mlx_available() and OLLAMA_MODELS:
+        default_model = next(iter(OLLAMA_MODELS))
 
     # ── Model picker — shown once at startup ──────────────────────────────
     default_model = _model_picker(OLLAMA_MODELS, MODELS, default_model)
