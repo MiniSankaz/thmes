@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    name: Regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install the runtime deps the tests import
+        run: pip install --quiet prompt_toolkit rich
+      - name: Run test suite
+        run: |
+          set -e
+          fail=0
+          for t in test_r_relay test_r_behavioral test_r_dimensions \
+                   test_r_research_loop test_r_provider test_r_tools \
+                   test_c_skill_handler test_skill_phase_parsing; do
+            echo "──────── $t ────────"
+            python "tests/$t.py" || fail=1
+          done
+          exit $fail
+
+  privacy-scan:
+    name: Privacy / secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Guard against the private-ecosystem content (daemon-core / personal paths /
+      # ctx-* CLI / internal hosts) ever creeping back into the public repo.
+      # The workflow file itself is excluded (it names these patterns on purpose).
+      - name: No private-ecosystem references
+        run: |
+          if git grep -nIE 'daemon-core|/Users/sem4pro|ctx-(flow|mem|obs|ops)[^a-z]|PI_PQA|DepthFirst|192\.168\.[0-9]|127\.0\.0\.1:5000|Message-Gateway' \
+               -- . ':(exclude).github/workflows/ci.yml'; then
+            echo "::error::Private-ecosystem reference found — keep it out of the public repo"
+            exit 1
+          fi
+          echo "No private references ✓"
+      - name: No hard-coded secrets
+        run: |
+          if git grep -nIE '(AKIA[0-9A-Z]{16}|gh[posru]_[A-Za-z0-9]{30}|AIza[0-9A-Za-z_-]{30}|xox[baprs]-[A-Za-z0-9-]{10}|-----BEGIN [A-Z ]*PRIVATE KEY-----)' \
+               -- . ':(exclude)tests/*' ':(exclude)lib/thmes_mask.py' ':(exclude).github/workflows/ci.yml'; then
+            echo "::error::Possible hard-coded secret committed"
+            exit 1
+          fi
+          echo "No secrets ✓"

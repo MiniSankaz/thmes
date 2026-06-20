@@ -14,6 +14,7 @@
 An agentic terminal for local **MLX / Ollama** models<br>
 🛡️ privacy relay&nbsp; · &nbsp;🤖 agentic tools&nbsp; · &nbsp;🔧 self-heal&nbsp; · &nbsp;🌐 browser terminal
 
+![ci](https://github.com/MiniSankaz/thmes/actions/workflows/ci.yml/badge.svg)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-444?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![models](https://img.shields.io/badge/models-MLX%20%7C%20Ollama-FF6F00?style=flat-square)
