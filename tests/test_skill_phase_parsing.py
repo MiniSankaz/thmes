@@ -76,21 +76,17 @@ def _parse_skill_phases(body: str) -> list:
 # number invented before reading the files.
 # ---------------------------------------------------------------------------
 
-SKILLS_DIR = pathlib.Path.home() / ".claude" / "skills"
+# Prefer the repo's own skills/ (so the test is self-contained and CI-portable);
+# fall back to the user's ~/.claude/skills when this checkout ships no skills/.
+_REPO_SKILLS = pathlib.Path(__file__).resolve().parent.parent / "skills"
+SKILLS_DIR = _REPO_SKILLS if _REPO_SKILLS.is_dir() else (pathlib.Path.home() / ".claude" / "skills")
 
-MULTI_PHASE_SKILLS = [
-    "debug",
-    "analyze",
-    "deploy",
-    "estimate",
-    "implement",
-    "migrate",
-    "onboard",
-    "performance",
-    "refactor",
-    "review",
-    "security-audit",
-]
+# Only exercise multi-phase skills that are actually present in this checkout — the
+# public scaffold bundles a curated subset, so a hard-coded list would go stale.
+MULTI_PHASE_SKILLS = [s for s in (
+    "debug", "analyze", "deploy", "estimate", "implement", "migrate",
+    "onboard", "performance", "refactor", "review", "security-audit",
+) if (SKILLS_DIR / s / "SKILL.md").exists()]
 
 # ---------------------------------------------------------------------------
 # Test helpers
