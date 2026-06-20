@@ -1,4 +1,4 @@
-#!/usr/bin/env -S /Users/semini/.mlx-env/bin/python
+#!/usr/bin/env python3
 """thmes-daemon — Background worker process for autonomous goals.
 
 Polls ~/.thmes/data/goals.db, picks up queued goals, runs them via the

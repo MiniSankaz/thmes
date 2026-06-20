@@ -1,4 +1,4 @@
-#!/usr/bin/env -S /Users/semini/.mlx-env/bin/python
+#!/usr/bin/env python3
 """thmes-pro — Textual-based agentic TUI (next-gen successor to thmes classic).
 
 Three-pane layout:

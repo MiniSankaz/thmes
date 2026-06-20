@@ -1,4 +1,4 @@
-#!/usr/bin/env -S /Users/semini/.mlx-env/bin/python
+#!/usr/bin/env python3
 """thmes — THMES: Thai Hermes Agentic Shell. Local-model TUI with tool calling.
 
 Features:
@@ -682,8 +682,8 @@ def tool_current_datetime(format: str = "default") -> str:
 # ║ Models trained on public corpora memorize specific usernames (often   ║
 # ║ /Users/<original-dev>/) and will write to those paths verbatim even   ║
 # ║ when running on a machine where that user does NOT exist. We've seen  ║
-# ║ models attempt `/Users/semini/Desktop/...` on a machine whose user is ║
-# ║ `sem4pro`. Two-layer fix mirroring the datetime pattern:              ║
+# ║ models attempt `/Users/<other>/Desktop/...` on a machine whose user   ║
+# ║ is different. Two-layer fix mirroring the datetime pattern:           ║
 # ║   1. Always-on context block listing the real cwd/home/Desktop paths  ║
 # ║   2. `current_directory` tool for mid-turn lookup                     ║
 # ║   3. Defensive guard in tool_write_file rejecting other-user homes   ║
