@@ -169,7 +169,7 @@ mem.compact(session_id="abc", keep_recent=4)   # move old → L2 summary
 // ~/.thmes/mcp.json
 {
   "servers": {
-    "filesystem": {"command": "mcp-server-filesystem", "args": ["/Users/semini"]},
+    "filesystem": {"command": "mcp-server-filesystem", "args": ["/home/you"]},
     "github":     {"command": "mcp-server-github",     "env": {"GITHUB_TOKEN": "..."}},
     "memory":     {"command": "python -m thmes.mcp.memory_server"},
     "ollama":     {"command": "mcp-server-ollama"}

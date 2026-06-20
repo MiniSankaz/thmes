@@ -8,7 +8,7 @@ mcp.json format (compatible with Claude Code):
   "mcpServers": {
     "filesystem": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/semini"]
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/you"]
     },
     "github": {
       "command": "npx",

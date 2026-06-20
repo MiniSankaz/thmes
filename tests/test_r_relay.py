@@ -84,14 +84,14 @@ THAI = _valid_thai_id_num()
 v = MaskVault()
 ner = lambda t: [("Falcon", "project"), ("Acme Corp", "company"), ("John Smith", "person")]
 src = (f"mail john@acme.co / jane@acme.co tel 0812345678 ip 10.2.3.4 "
-       f"key sk-ABCDEFGHIJKLMNOPQRSTUVWX path /Users/semini/secret id {THAI} "
+       f"key sk-ABCDEFGHIJKLMNOPQRSTUVWX path /home/alice/.secret id {THAI} "
        f"password: hunter2xyz project Falcon at Acme Corp by John Smith")
 masked = v.mask(src, ner_fn=ner)
 
 check("Rr1-1 round-trip restores exactly", v.unmask(masked) == src,
       f"got {v.unmask(masked)!r}")
 REALS = ["john@acme.co", "jane@acme.co", "0812345678", "10.2.3.4",
-         "sk-ABCDEFGHIJKLMNOPQRSTUVWX", "/Users/semini/secret", THAI,
+         "sk-ABCDEFGHIJKLMNOPQRSTUVWX", "/home/alice/.secret", THAI,
          "hunter2xyz", "Falcon", "Acme Corp", "John Smith"]
 leaked = [r for r in REALS if r in masked]
 check("Rr1-2 NO real value in masked payload", not leaked, f"leaked: {leaked}")
