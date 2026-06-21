@@ -26,13 +26,11 @@ try {
     }
 } catch { }
 
-Write-Host @"
-
-Done. Shims removed.
-
-Runtime data preserved:
-  %USERPROFILE%\.thmes\           (sessions, memory, agents, mcp.json)
-  %USERPROFILE%\.thmes-history    (input history)
-
-To wipe runtime data:  Remove-Item -Recurse -Force `$env:USERPROFILE\.thmes
-"@
+Write-Host ""
+Write-Host "Done. Shims removed."
+Write-Host ""
+Write-Host "Runtime data preserved:"
+Write-Host "  %USERPROFILE%\.thmes\           (sessions, memory, agents, mcp.json)"
+Write-Host "  %USERPROFILE%\.thmes-history    (input history)"
+Write-Host ""
+Write-Host "To wipe runtime data:  Remove-Item -Recurse -Force $env:USERPROFILE\.thmes"
