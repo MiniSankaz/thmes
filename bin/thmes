@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S /Users/semini/.mlx-env/bin/python
 """thmes — THMES: Thai Hermes Agentic Shell. Local-model TUI with tool calling.
 
 Features:
@@ -373,11 +373,11 @@ def load_agents() -> dict:
         for adir in sorted(THMES_AGENTS.iterdir()):
             if not adir.is_dir(): continue
             try:
-                identity = json.loads((adir / "identity.json").read_text())
-                caps     = json.loads((adir / "capabilities.json").read_text())
-                safeg    = json.loads((adir / "safeguards.json").read_text())
-                cfg      = json.loads((adir / "config.json").read_text())
-                prompt   = (adir / "system-prompt.txt").read_text()
+                identity = json.loads((adir / "identity.json").read_text(encoding="utf-8"))
+                caps     = json.loads((adir / "capabilities.json").read_text(encoding="utf-8"))
+                safeg    = json.loads((adir / "safeguards.json").read_text(encoding="utf-8"))
+                cfg      = json.loads((adir / "config.json").read_text(encoding="utf-8"))
+                prompt   = (adir / "system-prompt.txt").read_text(encoding="utf-8")
             except (FileNotFoundError, json.JSONDecodeError):
                 continue
             out[identity["name"]] = {
@@ -402,7 +402,7 @@ def load_agents() -> dict:
     # Fallback: ~/.claude/agents/<name>.md
     for p in sorted(CLAUDE_AGENTS.glob("*.md")):
         if p.name.endswith(".bak"): continue
-        fm, body = _parse_fm(p.read_text())
+        fm, body = _parse_fm(p.read_text(encoding="utf-8"))
         out[p.stem] = {
             "description": fm.get("description", "")[:200],
             "system":      body.strip(),
@@ -426,7 +426,7 @@ def load_agents() -> dict:
 def load_skills() -> dict:
     out = {}
     for p in sorted(CLAUDE_SKILLS.glob("*/SKILL.md")):
-        fm, body = _parse_fm(p.read_text())
+        fm, body = _parse_fm(p.read_text(encoding="utf-8"))
         out[p.parent.name] = {
             "description": fm.get("description", "")[:200],
             "body": body.strip(),
@@ -682,8 +682,8 @@ def tool_current_datetime(format: str = "default") -> str:
 # ║ Models trained on public corpora memorize specific usernames (often   ║
 # ║ /Users/<original-dev>/) and will write to those paths verbatim even   ║
 # ║ when running on a machine where that user does NOT exist. We've seen  ║
-# ║ models attempt `/Users/<other>/Desktop/...` on a machine whose user   ║
-# ║ is different. Two-layer fix mirroring the datetime pattern:           ║
+# ║ models attempt `/Users/semini/Desktop/...` on a machine whose user is ║
+# ║ `sem4pro`. Two-layer fix mirroring the datetime pattern:              ║
 # ║   1. Always-on context block listing the real cwd/home/Desktop paths  ║
 # ║   2. `current_directory` tool for mid-turn lookup                     ║
 # ║   3. Defensive guard in tool_write_file rejecting other-user homes   ║
@@ -788,7 +788,7 @@ def _validate_user_path(p: Path) -> Optional[str]:
 
 def tool_read_file(path: str) -> str:
     p = Path(path).expanduser()
-    return _truncate(p.read_text())
+    return _truncate(p.read_text(encoding="utf-8", errors="replace"))
 
 def tool_write_file(path: str, content: str, mode: str = "w") -> str:
     """Write or append to a file.  mode='w' overwrites (default); mode='a' appends.
@@ -7275,12 +7275,12 @@ def main():
                 continue
             if cmd == "/save":
                 fn = Path(arg or f"chat-{int(time.time())}.json").expanduser()
-                fn.write_text(json.dumps(history, ensure_ascii=False, indent=2))
+                fn.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
                 console.print(f"[green]saved →[/] {fn}"); continue
             if cmd == "/load":
                 fn = Path(arg).expanduser()
                 if not fn.exists(): console.print(f"[red]no file:[/] {fn}"); continue
-                history = json.loads(fn.read_text())
+                history = json.loads(fn.read_text(encoding="utf-8"))
                 console.print(f"[green]loaded {len(history)} messages[/]"); continue
             if cmd == "/stats":
                 if not last_stats: console.print("[dim](no gen yet)[/]"); continue
