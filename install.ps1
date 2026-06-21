@@ -66,12 +66,12 @@ try {
     Write-Host "      $BinDir"
 }
 
-Write-Host ""
-Write-Host "Done. Open a NEW terminal, then run:  thmes"
-Write-Host ""
-Write-Host "Windows notes:"
-Write-Host "  * MLX is Apple-Silicon only -> use an Ollama model:  set THMES_MODEL=ol:llama3.2:3b"
-Write-Host "    (install Ollama from https://ollama.com, then: ollama pull llama3.2:3b)"
-Write-Host "  * The bash tool, gemma, mlx-serve-* and the web terminal (thmes-web) are Unix-only."
-Write-Host "  * For full features (web terminal, bash tool) run thmes under WSL:"
-Write-Host "        wsl --install   then inside WSL:  ./install.sh"
+Write-Host ''
+Write-Host 'Done. Open a NEW terminal, then run:  thmes'
+Write-Host ''
+Write-Host 'Windows notes:'
+Write-Host '  * MLX is Apple-Silicon only -> use an Ollama model:  set THMES_MODEL=ol:llama3.2:3b'
+Write-Host '    (install Ollama from https://ollama.com, then: ollama pull llama3.2:3b)'
+Write-Host '  * The bash tool, gemma, mlx-serve-* and the web terminal (thmes-web) are Unix-only.'
+Write-Host '  * For full features (web terminal, bash tool) run thmes under WSL:'
+Write-Host '        wsl --install   then inside WSL:  ./install.sh'
