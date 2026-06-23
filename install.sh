@@ -73,16 +73,53 @@ WRAPPER
   fi
 }
 
-# Top-level executables (thmes-* = app; gemma/mlx-serve-gemma = Gemma-model tools)
-for script in thmes thmes-pro thmes-daemon thmes-web gemma hermes-use \
-              mlx-serve-gemma mlx-serve-qwen mlx-serve-qwen3; do
-  install_script "$PROJ_DIR/bin/$script" "$LOCAL_BIN/$script"
+# This is the DEV (private) checkout — it installs every command under a `dev-`
+# prefix (dev-thmes, dev-thmes-pro, …) so it coexists with a public `thmes`
+# install on the same machine.
+SCRIPTS="thmes thmes-pro thmes-daemon thmes-web gemma hermes-use \
+mlx-serve-gemma mlx-serve-qwen mlx-serve-qwen3"
+for script in $SCRIPTS; do
+  install_script "$PROJ_DIR/bin/$script" "$LOCAL_BIN/dev-$script"
+done
+
+# Free any UN-prefixed command left by a PREVIOUS install of THIS repo, so it no
+# longer shadows a public `thmes` install (only removes links that point here).
+for script in $SCRIPTS; do
+  old="$LOCAL_BIN/$script"
+  if { [ -L "$old" ] && [ "$(readlink "$old")" = "$PROJ_DIR/bin/$script" ]; } \
+     || { [ -f "$old" ] && grep -q "$PROJ_DIR/bin/$script" "$old" 2>/dev/null; }; then
+    rm "$old"; echo "  ↪ removed old un-prefixed '$script' (now 'dev-$script')"
+  fi
 done
 
 # Remove stale symlinks from the pre-rename layout (gemma-pro/gemma-daemon)
 for old in gemma-pro gemma-daemon; do
   [ -L "$LOCAL_BIN/$old" ] && rm "$LOCAL_BIN/$old" && echo "  ↪ removed stale $old symlink"
 done
+
+# ── Web UI config: ensure `websockets` so `dev-thmes-web` works on first run ──────
+# thmes-web auto-installs it on demand too, but doing it here makes the first launch
+# instant. Pick the same Python the wrappers use (thmes venv → mlx venv → python3).
+echo ""
+WEB_PY=""
+for candidate in "${HOME}/.thmes-env/bin/python" "${HOME}/.mlx-env/bin/python"; do
+  [ -x "$candidate" ] && WEB_PY="$candidate" && break
+done
+[ -n "$WEB_PY" ] || WEB_PY="$(command -v python3 2>/dev/null || true)"
+if [ -n "$WEB_PY" ]; then
+  if "$WEB_PY" -c "import websockets" 2>/dev/null; then
+    echo "  ✓ web UI: 'websockets' present in $WEB_PY"
+  else
+    echo "  → web UI: installing 'websockets' into $WEB_PY …"
+    if "$WEB_PY" -m pip install --quiet websockets 2>/dev/null; then
+      echo "  ✓ web UI ready — run 'dev-thmes-web', open http://localhost:8765"
+    else
+      echo "  ⚠ web UI: websockets install failed — 'dev-thmes-web' will retry on first run"
+    fi
+  fi
+else
+  echo "  ⚠ web UI: no Python found to install 'websockets'"
+fi
 
 echo ""
 echo "✓ Installation complete."
@@ -93,4 +130,5 @@ echo ""
 echo "If missing, add to ~/.zshrc:"
 echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
 echo ""
-echo "Try:  thmes"
+echo "Try:  dev-thmes        (this dev build; the public release installs as 'thmes')"
+echo "      dev-thmes-web    (browser terminal → http://localhost:8765)"

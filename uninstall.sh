@@ -6,8 +6,8 @@
 set -euo pipefail
 LOCAL_BIN="$HOME/.local/bin"
 
-for script in thmes thmes-pro thmes-daemon thmes-web gemma hermes-use \
-              mlx-serve-gemma mlx-serve-qwen mlx-serve-qwen3 \
+for script in dev-thmes dev-thmes-pro dev-thmes-daemon dev-thmes-web dev-gemma \
+              dev-hermes-use dev-mlx-serve-gemma dev-mlx-serve-qwen dev-mlx-serve-qwen3 \
               gemma-pro gemma-daemon; do  # last two = legacy names, cleaned up too
   link="$LOCAL_BIN/$script"
   if [ -L "$link" ] || [ -f "$link" ]; then   # symlink OR generated wrapper

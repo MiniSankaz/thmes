@@ -1,9 +1,9 @@
 # thmes — Evolution Roadmap
 
 > From terminal chat → agentic kernel
-> Inspired by [agent-kernel](https://github.com/MiniSankaz/agent-kernel) by sem4pro
+> Inspired by [agent-kernel](https://github.com/MiniSankaz/agent-kernel) by MiniSankaz
 
-**Current**: v0.3 — single-file Python TUI with smart router, opencode delegation, salvage layer
+**Current**: v0.4.0 — adds privacy-relay (one-shot/agentic/local-only), working-dir, Office-doc reading, Ollama-first default (on top of v0.3: smart router, opencode delegation, salvage layer). `VERSION` constant in `bin/thmes`; shown in banner + live header; `thmes --version`.
 **Target**: v1.0 — Multi-tier agentic system with persistent memory, orchestration, autonomous goals
 
 ---
@@ -407,6 +407,64 @@ final answer  ── UNMASK ──▶ user
 - Tool-result leak policy = **redact-and-continue**: if a secret survives masking, the
   whole result is withheld from the cloud (the action already ran locally).
 - `run_relay_agent_loop` in `bin/thmes` (CODEMAP §2.10); tunables `THMES_RELAY_MAX_ITERS`.
+
+### Local-only relay — cloud = director, local = hands+eyes · 2026-06-22
+
+Opt-in sub-mode (`/relay local on`, flag `relay_local`, default OFF; **precedence over
+`relay_tools`**). The strictest privacy posture: where agentic relay sends *masked tool
+results* up, local-only sends **no file content at all** — masked or not. The cloud is a
+**director** that emits one plain-language step at a time and only reads a short,
+content-free status line back; the LOCAL model does every read/edit/run on real data.
+
+```
+cloud (masked task) ── emits ──▶ "step: add a 30s timeout to the http client"
+                    ◀── UNMASK step ── local agent_turn executes on REAL data (own history)
+                    ── distil → ONE masked status line ──▶ cloud   … repeat until "DONE:"
+DONE: summary ── UNMASK ──▶ user
+```
+
+- Solves the small-model gap: the local model often can't *plan* a multi-step task but
+  can *carry out* a concrete instruction — cloud supplies reasoning, local supplies the
+  hands+eyes, and file content never crosses the network.
+- Status distiller (`_relay_local_status`) is itself a LOCAL pass told to omit code/content;
+  masked + leak-scanned, with a generic fallback if anything risky survives.
+- `run_relay_local_loop` in `bin/thmes` (CODEMAP §2.10); reuses `agent_turn` as the executor.
+
+### Ollama-first default model · 2026-06-22
+
+Startup now prefers an available Ollama model as the default when the user hasn't pinned
+`THMES_MODEL` — Ollama is the primary backend on most machines and needs no MLX install.
+The `DEFAULT_MODEL` constant is unchanged (sync-safe); only the startup *resolution*
+adapts (`_THMES_MODEL_EXPLICIT` gate in `main()`). MLX-only machines (no Ollama) keep
+their MLX default; an explicit `THMES_MODEL` always wins; a pinned-but-unloadable MLX
+alias still falls back to Ollama. Verified across `gemma4:e2b/e4b` + `typhoon2.5` (100%
+on a csv/xlsx/pptx read-and-answer eval).
+
+### Router decides web-vs-local (no keyword regex) · 2026-06-22
+
+A local question — "ตอนนี้ใน folder คุณเห็นไฟล์อะไรบ้าง" — used to launch a 92s web-research
+loop because `_RESEARCH_TRIGGER_RE` matched the time word "ตอนนี้" and bypassed the router.
+Reworked so the **LLM router decides**, not a regex:
+
+- `ROUTER_PROMPT` emits a `web` bool; `smart_route` returns it. The keyword fast-path no
+  longer short-circuits a web tool (defers ambiguous "ล่าสุด" to the LLM); an empty tool
+  selection loads the full toolset instead of crippling the agent.
+- Auto-research now fires only when **the router picked a web tool AND no local/file tool**
+  (`_LOCAL_INTENT_TOOLS`) — so "ไฟล์ล่าสุด" → `[list_dir,bash,web_search]` reads as local
+  (web_search stays as the agent's fallback), "ราคาทองวันนี้" → `[web_search]` reads as web.
+  The standalone `web` bool is too noisy to trigger on (small models mislabel it, big models
+  over-include web_search). Regex remains only as the no-router fallback.
+- Validated by a **206-case TH/EN stress test** on the two router models: local categories
+  ~100% on both; gemma4:e2b ~84% (residual misses are genuine 2B ambiguity on "X ล่าสุด"),
+  typhoon2.5 web categories ~100%. Bigger router model = better ambiguous-case routing.
+
+### Working directory (project root) · 2026-06-22
+
+`thmes` now anchors all relative file work to a **project root** that defaults to the
+directory it was launched from and is changeable at runtime (`/cd`, `/pwd`, or the
+`set_workdir` tool). `_set_workdir` does `os.chdir` + updates the `_WORKDIR` global so
+relative paths, grep globs, and shell/python children all resolve against the same root.
+Pairs naturally with local-only relay (cloud says "work in project X" → local sets root).
 
 ---
 

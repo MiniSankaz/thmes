@@ -14,7 +14,6 @@
 An agentic terminal for local **MLX / Ollama** models<br>
 🛡️ privacy relay&nbsp; · &nbsp;🤖 agentic tools&nbsp; · &nbsp;🔧 self-heal&nbsp; · &nbsp;🌐 browser terminal
 
-![ci](https://github.com/MiniSankaz/thmes/actions/workflows/ci.yml/badge.svg)
 ![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-444?style=flat-square)
 ![python](https://img.shields.io/badge/python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![models](https://img.shields.io/badge/models-MLX%20%7C%20Ollama-FF6F00?style=flat-square)
@@ -25,167 +24,187 @@ An agentic terminal for local **MLX / Ollama** models<br>
 
 </div>
 
-> ⚠️ **Preview release** — ใช้งานได้แต่ API/CLI อาจเปลี่ยนโดยไม่แจ้งล่วงหน้า feedback ยินดีรับที่ [Issues](https://github.com/MiniSankaz/thmes/issues)
+> ⚠️ **Synced repo** · this project is synced across machines (different usernames, paths, models) — don't commit machine-specific paths/shebangs/model names; override at the call site (env var).
+> **รีโปนี้ sync หลายเครื่อง** — อย่า commit ค่าเฉพาะเครื่อง ให้ override ที่ call site (env var)
 
 ---
 
 ## ภาษาไทย
 
-Agentic terminal UI สำหรับ **MLX / Ollama** model บน local: built-in tools, smart router เลือก context เอง, persistent session บน SQLite, MCP integration, multi-tier semantic memory, multi-source research, **privacy relay** และ **web terminal**
+เทอร์มินัล UI แบบ agentic สำหรับโมเดล **MLX / Ollama** ในเครื่อง: มีเครื่องมือในตัว, smart router เลือก context เอง, session ถาวรบน SQLite, รองรับ MCP, memory เชิงความหมายหลายชั้น, research หลายแหล่ง, **privacy relay** และ **เทอร์มินัลบนเบราว์เซอร์**
 
-### ✨ Highlights
+### ✨ ไฮไลต์
 
-- รองรับทั้ง **MLX** model (local) และ **Ollama** (local + cloud ที่ `ollama signin` แล้ว เช่น `gpt-oss:120b-cloud`)
-- **Privacy relay** — ใช้ cloud model ตัวแรง reason/act กับ data ของคุณ โดย**ค่าจริงไม่ออกนอกเครื่อง**
-- **Agentic tools + self-heal** — cloud สั่ง tool call, local execute จริง, แล้ว loop verify → triage error → re-ask cloud เพื่อ fix เอง
-- **Web terminal** — เปิด full CLI ใน browser (PTY + WebSocket + xterm.js) ทุกอย่าง run บน local
+- ใช้ได้ทั้งโมเดล **MLX** ในเครื่อง และ **Ollama** (ทั้ง local และ cloud ที่ `ollama signin` แล้ว เช่น `gpt-oss:120b-cloud`)
+- **Privacy relay** — ใช้โมเดล cloud ตัวแรงคิด/ทำงานกับข้อมูลของคุณ โดย**ค่าจริงไม่ออกนอกเครื่อง**
+- **Agentic tools + self-heal** — cloud สั่งใช้ tool, เครื่องนี้รันจริง, แล้ววน verify → วิเคราะห์ error → ถาม cloud ใหม่เพื่อแก้เอง
+- **Web terminal** — เปิด CLI เต็มในเบราว์เซอร์ (PTY + WebSocket + xterm.js) ทุกอย่างรันในเครื่อง
 
-### 📂 Project Structure
+### 📂 โครงสร้างโปรเจกต์
 
 ```
 thmes/
-├── bin/                      # Executables
-│   ├── thmes                 # Main UI (Rich + prompt_toolkit)
-│   ├── thmes-pro             # Multi-pane UI (Textual, experimental)
-│   ├── thmes-daemon          # Background goal worker
-│   ├── thmes-web             # Web terminal launcher → web/server.py
-│   ├── gemma                 # One-shot CLI / --server (OpenAI-compatible :8081)
+├── bin/                      # ไฟล์รัน
+│   ├── thmes                 # UI หลัก (Rich + prompt_toolkit)
+│   ├── thmes-pro             # UI หลายแพเนล (Textual, ทดลอง)
+│   ├── thmes-daemon          # ตัวรัน goal เบื้องหลัง
+│   ├── thmes-web             # ตัวเปิด web terminal → web/server.py
+│   ├── gemma                 # CLI ครั้งเดียว / --server (OpenAI-compatible :8081)
 │   ├── mlx-serve-{gemma,qwen,qwen3}   # MLX HTTP server
-│   └── hermes-use            # Point Hermes ไปที่ local model
-├── lib/                      # Python modules
-│   ├── thmes_mask.py         # ★ Privacy relay masking engine
+│   └── hermes-use            # ชี้ Hermes ไปโมเดล local
+├── lib/                      # โมดูล Python
+│   ├── thmes_mask.py         # ★ เอนจิน masking ของ privacy relay
 │   ├── thmes_mcp.py          # MCP client
-│   ├── thmes_memory.py       # Multi-tier memory + embeddings
-│   ├── thmes_orchestrator.py # Multi-step orchestrator (L2)
-│   ├── thmes_goals.py        # Autonomous goal queue (L3)
-│   └── thmes_registry.py     # Hot-swap model registry
-├── web/                      # ★ Web terminal (server.py + index.html)
-├── agents/                   # 12 agent personas (5 files each: JSON/txt)
-├── tests/                    # Regression tests (test_r_*.py — run real code)
-├── docs/                     # CODEMAP.md (source index) · ROADMAP.md
-├── install.sh / install.ps1  # Installers (Unix / Windows)
+│   ├── thmes_memory.py       # memory หลายชั้น + embeddings
+│   ├── thmes_orchestrator.py # orchestrator หลายสเต็ป (L2)
+│   ├── thmes_goals.py        # คิว goal อัตโนมัติ (L3)
+│   └── thmes_registry.py     # registry สลับโมเดลแบบ hot-swap
+├── web/                      # ★ เทอร์มินัลบนเว็บ (server.py + index.html)
+├── agents/                   # 14 เพอร์โซนา (ชุดละ 5 ไฟล์ JSON/txt)
+├── tests/                    # เทสต์ regression (test_r_*.py — รันโค้ดจริง)
+├── docs/                     # CODEMAP.md (ดัชนีโค้ด) · ROADMAP.md
+├── install.sh / install.ps1  # ตัวติดตั้ง (Unix / Windows)
 └── README.md
 ```
 
-### 🚀 Quick Start
+### 🚀 เริ่มใช้งาน
 
-**macOS / Linux** — install symlink เข้า `~/.local/bin` (อยู่ใน `PATH`):
+**macOS / Linux** — ติดตั้ง symlink เข้า `~/.local/bin` (อยู่ใน `PATH`):
 ```bash
-./install.sh                 # symlink/wrapper สำหรับ bin/* (idempotent — run ซ้ำได้)
+./install.sh                 # symlink/wrapper ของ bin/* (idempotent รันซ้ำได้)
 ```
 
 **Windows** (PowerShell) — สร้าง `.cmd` shim บน user `PATH`:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
-> Windows support แบบ **best-effort**: TUI run ผ่าน **Ollama** ได้ (ไม่มี MLX) แต่ `bash` tool, `gemma`, `mlx-serve-*` และ **web terminal** เป็น Unix-only — ถ้าต้องการ full feature ให้ run ผ่าน **WSL**
+> Windows รองรับแบบ **best-effort**: TUI รันผ่าน **Ollama** ได้ (ไม่มี MLX) แต่ `bash` tool, `gemma`, `mlx-serve-*` และ **web terminal** เป็น Unix-only — ถ้าต้องการครบให้รันผ่าน **WSL**
 
-จากนั้น (เปิด terminal ใหม่ก่อน):
+จากนั้น (เปิดเทอร์มินัลใหม่ก่อน):
 ```bash
-thmes                        # main UI
-thmes-pro                    # multi-pane UI (experimental)
+thmes                        # UI หลัก
+thmes-pro                    # UI หลายแพเนล (ทดลอง)
 ```
 
-Runtime data ถูกสร้าง auto ใน `~/.thmes/` (override location ด้วย `THMES_HOME=/path`):
+ข้อมูลตอนรันถูกสร้างอัตโนมัติใน `~/.thmes/` (เปลี่ยนที่เก็บด้วย `THMES_HOME=/path`):
 
-| Path | Purpose |
+| Path | ใช้ทำอะไร |
 |---|---|
-| `~/.thmes/data/sessions.db` | Persistent chat sessions |
-| `~/.thmes/data/memory.db` | Memory + embeddings |
-| `~/.thmes/mcp.json` | MCP config (optional) |
-| `~/.thmes-history` | Input history |
+| `~/.thmes/data/sessions.db` | session แชตถาวร |
+| `~/.thmes/data/memory.db` | memory + embeddings |
+| `~/.thmes/mcp.json` | คอนฟิก MCP (ไม่บังคับ) |
+| `~/.thmes-history` | ประวัติ input |
 
-### 🎛 Key Features
+### 🎛 คุณสมบัติเด่น
 
-| Feature | Usage |
+| คุณสมบัติ | วิธีใช้ |
 |---|---|
-| Smart router — model เลือก tools/agent/skills เอง | Auto on startup |
-| 12 agent personas | `/agent NAME` |
-| 13 skill workflows | `/skill NAME` |
-| 17 built-in tools (read/write/edit/bash/python/grep/web/make_report/…) | `/tool list` |
-| Persistent SQLite sessions | `/session list\|load\|new` |
-| Auto-compact context ที่ 60% | `/compact threshold N` |
-| Circuit breaker (fail 3 ครั้ง → cooldown 15s) | `/breakers` |
-| Deterministic multi-source research | `/research Q` |
-| **Privacy relay** (mask → cloud → unmask) | `/relay …` (ดูด้านล่าง) |
-| **Web terminal** ใน browser | `thmes-web` |
-| Semantic memory | `/memory recall Q` |
-| Image + audio | `/image PATH` · `/audio PATH` |
-| กด ESC cancel generation/tool | `ESC` |
+| Smart router — โมเดลเลือก tools/agent/skills เอง | อัตโนมัติตอนเริ่ม |
+| 14 เพอร์โซนา | `/agent NAME` |
+| 36 สกิล | `/skill NAME` |
+| 17 เครื่องมือในตัว (read/write/edit/bash/python/grep/web/make_report/…) | `/tool list` |
+| session ถาวรบน SQLite | `/session list\|load\|new` |
+| ย่อ context อัตโนมัติที่ 60% | `/compact threshold N` |
+| Circuit breaker (พัง 3 ครั้ง → พัก 15 วิ) | `/breakers` |
+| research หลายแหล่งแบบ deterministic | `/research Q` |
+| **Privacy relay** (ปิดบัง → cloud → ถอดคืน) | `/relay …` (ดูด้านล่าง) |
+| **Web terminal** ในเบราว์เซอร์ | `thmes-web` |
+| memory เชิงความหมาย | `/memory recall Q` |
+| รูป + เสียง | `/image PATH` · `/audio PATH` |
+| กด ESC ยกเลิกการ gen/tool | `ESC` |
 
-### 🛡️ Privacy Relay
+### 🛡️ Privacy relay
 
-ใช้ **cloud** model ตัวแรงโดยที่ sensitive data ไม่ออกนอกเครื่องเลย — local model เป็น trusted middle layer:
+ใช้โมเดล **cloud** ตัวแรงโดยที่ข้อมูลอ่อนไหวไม่ออกนอกเครื่องเลย — โมเดล local เป็นชั้นกลางที่เชื่อถือได้:
 
 ```
-real text ─MASK (local)─▶ cloud เห็นแค่ __PII_*__ ─REASON─▶ ─UNMASK (local)─▶ user
-                          ▲ leak-scan abort ทันทีถ้า real value/secret จะหลุดออก
+ข้อความจริง ─MASK (local)─▶ cloud เห็นแต่ __PII_*__ ─REASON─▶ ─UNMASK (local)─▶ ผู้ใช้
+                           ▲ leak-scan ยกเลิกทันทีถ้าค่าจริง/secret จะหลุดออก
 ```
 
-Hybrid masking: regex (email/phone/Thai-ID/credit-card/API-key/.env/IP/path) + local-model NER (person/org/project) + deny-list — vault อยู่ใน RAM per-session **ไม่ write disk ไม่ send cloud**
+ปิดบังแบบไฮบริด: regex (อีเมล/เบอร์/เลขบัตร ปชช./บัตรเครดิต/API-key/.env/IP/path) + NER จากโมเดล local (ชื่อคน/องค์กร/โปรเจกต์) + deny-list — vault อยู่ใน RAM ต่อ session **ไม่เขียนดิสก์ ไม่ส่ง cloud**
 
-3 modes:
+มี 4 โหมด:
 
-| Mode | Description |
+| โหมด | ทำอะไร |
 |---|---|
-| **One-shot** `/relay on` | Cloud reason บน masked text, ไม่มี tools |
-| **Agentic** `/relay tools on` | Cloud สั่ง tool call → **local execute จริง** (unmask args just-in-time, re-mask results) |
-| **Self-heal** `/relay verify <cmd>` | Run verify → fail → local model triage error → cloud fix, loop |
-
-```bash
-/relay on                    # Enter relay mode (smoke-test cloud ก่อน)
-/relay model gpt-oss:120b-cloud   # Pick cloud "brain" (ต้อง ollama signin)
-/relay tools on              # Cloud drive tools, local execute
-/relay verify "python -m pytest"  # Self-heal: verify → triage → re-ask cloud
-/relay status                # View status · /relay deny add "Project X"
-```
-
-> Over-masking preferred — tool args จะ unmask ที่ local ก่อน execute (approval prompt แสดง **real** action)
-
-### 🌐 Web Terminal
-
-Run full `thmes` CLI ใน browser — `thmes-web` spawn REPL ใน pseudo-terminal แล้ว bridge เข้า [xterm.js](https://xtermjs.org/) ผ่าน WebSocket ได้ full CLI (routing/tools/sessions/relay) ใน browser, ทุกอย่าง run local
+| **One-shot** `/relay on` | cloud คิดบนข้อความที่ปิดบัง ไม่มี tool |
+| **Agentic** `/relay tools on` | cloud สั่งใช้ tool → **เครื่องนี้รันจริง** (ถอด args ตอนรัน, ปิดบังผลลัพธ์ก่อนส่งกลับ) |
+| **Local-only** `/relay local on` | cloud เป็น**ผู้กำกับ** สั่งงานทีละขั้น → โมเดล **local ทำงานกับไฟล์ทั้งหมดเอง** บนข้อมูลจริง — **เนื้อหาไฟล์ไม่ออกนอกเครื่องเลย แม้แต่แบบปิดบัง** (cloud เห็นแค่ status สั้น ๆ) |
+| **Self-heal** `/relay verify <cmd>` | รัน verify → ถ้า fail โมเดล local วิเคราะห์ error → cloud แก้ วนเอง |
 
 ```bash
-pip install websockets       # Install ครั้งเดียว
-thmes-web                    # → open http://localhost:8765
+/relay on                    # เข้าโหมด relay (smoke-test cloud ก่อน)
+/relay model gpt-oss:120b-cloud   # เลือก cloud "สมอง" (ต้อง ollama signin)
+/relay tools on              # ให้ cloud สั่ง tool, รันในเครื่อง
+/relay local on              # cloud กำกับ · local ทำงานไฟล์เองหมด · content ไม่ออกนอกเครื่อง
+/relay verify "python -m pytest"  # self-heal: verify → วิเคราะห์ → ถาม cloud ใหม่
+/relay status                # ดูสถานะทั้งหมด · /relay deny add "Project X"
 ```
 
-> ถ้า `thmes` shebang python ไม่มีบนเครื่องนี้ set `THMES_CMD="/path/to/python /path/to/bin/thmes"` — ดู `web/README.md`
+> **Agentic vs Local-only:** agentic ส่ง*ผลลัพธ์* tool (ที่ปิดบังแล้ว) กลับให้ cloud — เหมาะเมื่อ cloud ต้องเห็นข้อมูลเพื่อตัดสินใจ. local-only **ไม่ส่งเนื้อหาไฟล์ใด ๆ** ขึ้น cloud เลย — เหมาะเมื่อโมเดล local ทำงานเป็นแต่*วางแผน*ไม่เก่ง: ให้ cloud คิดแผน, local ลงมือ
+>
+> ระบบเลือกปิดบังเกินไว้ก่อนเพื่อความปลอดภัย; args ของ tool ถูกถอดคืนในเครื่องก่อนรัน (หน้าจอ approval โชว์ action **จริง**)
 
-### 🧠 Models
+#### 📂 Working directory (project root)
+
+`thmes` ยึดโฟลเดอร์ที่**เปิดมันขึ้นมา**เป็น project root — path แบบ relative (เช่น `src/app.py`) และคำสั่ง shell/python ทั้งหมด resolve ที่นี่ เปลี่ยนได้ทุกเมื่อ:
+
+```bash
+/pwd                         # ดู project root ปัจจุบัน
+/cd ~/work/myproject         # ย้าย root (absolute, ~/..., หรือ relative ก็ได้)
+```
+
+> โมเดลเรียก tool `set_workdir` เปลี่ยน root เองได้เมื่อสลับโปรเจกต์ — ใช้คู่กับ local-only relay ได้ดี (cloud สั่ง "ทำงานในโปรเจกต์ X" → local ตั้ง root แล้วลงมือ)
+
+#### 📄 อ่านไฟล์เอกสาร (csv / xlsx / pptx / docx)
+
+`read_file` แปลงไฟล์ Office เป็นข้อความให้อัตโนมัติ — โมเดลเล็กในเครื่องจึงอ่าน **.xlsx** (ชีต→แถว), **.pptx** (ข้อความสไลด์), **.docx** (ย่อหน้า), และ csv/code/text ได้เลยโดยไม่ต้องแปลงเอง ทุกอย่าง**สกัดในเครื่อง** (เข้ากับ local-only relay — เนื้อหาไม่ออกนอกเครื่อง) ใช้ `openpyxl`/`python-pptx`/`python-docx` ถ้ามี ไม่งั้น fallback เป็น `zipfile`+`xml` ของ stdlib (ติดตั้งแบบไม่มี dependency ก็ยังอ่านได้)
+
+### 🌐 Web terminal
+
+เปิด `thmes` CLI ตัวจริงในเบราว์เซอร์ — `thmes-web` รัน REPL ใน pseudo-terminal แล้วต่อเข้า [xterm.js](https://xtermjs.org/) ผ่าน WebSocket ได้ CLI เต็ม (routing/tools/sessions/relay) ในเบราว์เซอร์ ทุกอย่างรันในเครื่อง
+
+```bash
+pip install websockets       # ติดตั้งครั้งเดียว
+thmes-web                    # → เปิด http://localhost:8765
+```
+
+> ถ้า shebang python ของ `thmes` ไม่มีในเครื่องนี้ ตั้ง `THMES_CMD="/path/to/python /path/to/bin/thmes"` — ดู `web/README.md`
+
+### 🧠 โมเดล
 
 | Alias | Repo / Tag |
 |---|---|
 | `gemma` | `mlx-community/gemma-4-e4b-it-4bit` |
 | `qwen-vl` *(default)* | `mlx-community/Qwen3-VL-8B-Instruct-4bit` |
 | `qwen3` | `mlx-community/Qwen3-8B-4bit` |
-| `ol:<tag>` | Ollama model ใดก็ได้ เช่น `ol:gemma4:e4b`, `ol:qwen2.5-coder:7b` |
-| `<tag>:cloud` | Ollama **cloud** model (ต้อง `ollama signin`) เช่น `gpt-oss:120b-cloud` |
+| `ol:<tag>` | โมเดล Ollama ใด ๆ เช่น `ol:gemma4:e4b`, `ol:qwen2.5-coder:7b` |
+| `<tag>:cloud` | โมเดล Ollama **cloud** (ต้อง `ollama signin`) เช่น `gpt-oss:120b-cloud` |
 
 ```bash
-THMES_MODEL=gemma thmes      # or  THMES_MODEL=ol:gemma4:e4b
+THMES_MODEL=gemma thmes      # หรือ THMES_MODEL=ol:gemma4:e4b
 ```
 
-### 🔧 Dependencies
+### 🔧 ไลบรารีที่ต้องใช้
 
 Python 3.11+ ใน virtualenv (เช่น `~/.mlx-env/` หรือ `~/.thmes-env/`):
 ```bash
-mlx, mlx-vlm, mlx-lm, mlx-embeddings, mlx-audio   # MLX models
+mlx, mlx-vlm, mlx-lm, mlx-embeddings, mlx-audio   # โมเดล MLX
 rich, prompt_toolkit, textual                     # UI
-ddgs, trafilatura, beautifulsoup4, lxml           # Web tools
+ddgs, trafilatura, beautifulsoup4, lxml           # web tools
 mcp, huggingface_hub, transformers, safetensors
-websockets                                        # Web terminal only
+websockets                                        # เฉพาะ web terminal
 ```
 
-### 🛠 Development / Uninstall
+### 🛠 การพัฒนา / ถอนการติดตั้ง
 
-Edit files ได้เลย — มีผลทันทีเพราะ symlink (no build step); อ่าน `docs/CODEMAP.md` ก่อน scan code; run tests: `python -m pytest tests/`
+แก้ไฟล์ได้เลย — มีผลทันทีเพราะ symlink (ไม่มี build); อ่าน `docs/CODEMAP.md` ก่อนไล่โค้ด; รันเทสต์: `~/.mlx-env/bin/python -m pytest tests/`
 
 ```bash
 ./uninstall.sh                                # macOS/Linux
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1   # Windows
-rm -rf ~/.thmes                  # Remove runtime data (optional)
+rm -rf ~/.thmes                  # ลบข้อมูลตอนรัน (ไม่บังคับ)
 ```
 
 ---
@@ -221,7 +240,7 @@ thmes/
 │   ├── thmes_goals.py        # L3 autonomous goal queue
 │   └── thmes_registry.py     # Hot-swap model registry
 ├── web/                      # ★ Browser terminal (server.py + index.html)
-├── agents/                   # 12 agent identity bundles (5 files each)
+├── agents/                   # 14 agent identity bundles (5 files each)
 ├── tests/                    # Regression tests (test_r_*.py — EXECUTE real code)
 ├── docs/                     # CODEMAP.md (source index) · ROADMAP.md
 ├── install.sh / install.ps1  # Installers (Unix / Windows)
@@ -261,8 +280,8 @@ Runtime data is auto-created under `~/.thmes/` (override the location with `THME
 | Feature | How |
 |---|---|
 | Smart router — model picks its own tools/agent/skills | auto on startup |
-| 12 agent personas | `/agent NAME` |
-| 13 skill workflows | `/skill NAME` |
+| 14 agent personas | `/agent NAME` |
+| 36 skill workflows | `/skill NAME` |
 | 17 built-in tools (read/write/edit/bash/python/grep/web/make_report/…) | `/tool list` |
 | Persistent SQLite sessions | `/session list\|load\|new` |
 | Auto-compact at 60% context | `/compact threshold N` |
@@ -351,4 +370,4 @@ rm -rf ~/.thmes                  # runtime data (optional)
 
 ---
 
-*v0.1.0-preview.1 — agentic relay · self-heal · web terminal · cross-platform installers*
+*v0.5 — agentic relay · self-heal · web terminal · cross-platform installers*

@@ -3,10 +3,12 @@
 #
 #   thmes-web                 # then open http://localhost:8765
 #
-# Needs the `websockets` package in the chosen Python:  pip install websockets
-# Override the interpreter with THMES_WEB_PYTHON if `python3` lacks the package.
-# If the thmes shebang Python isn't on this host, set THMES_CMD, e.g.:
-#   THMES_CMD="$HOME/.thmes-env/bin/python /path/to/repo/bin/thmes" thmes-web
+# Self-bootstrapping: it auto-picks a Python that has `websockets` (installing the
+# package if none does) and serves the CLI from THIS checkout — so a dev symlink
+# (`dev-thmes-web`) just works without extra setup. Overrides:
+#   THMES_WEB_PYTHON   force the interpreter
+#   THMES_CMD          force the CLI command (default: this repo's bin/thmes)
+#   THMES_MODEL        forwarded to the CLI (e.g. ol:gemma4:e4b)
 set -e
 
 # Resolve this script's real location (it is symlinked into ~/.local/bin by install.sh).
@@ -18,5 +20,31 @@ while [ -L "$SOURCE" ]; do
 done
 REPO="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"   # repo root (parent of bin/)
 
-PY="${THMES_WEB_PYTHON:-python3}"
+# ── Pick a Python that can import `websockets` ───────────────────────────────────
+# This repo is synced across machines, so nothing is hardcoded: try the override, the
+# thmes venvs, the thmes shebang interpreter, then python3 — first one wins.
+shebang_py="$(sed -n '1s/^#![[:space:]]*//p' "$REPO/bin/thmes" 2>/dev/null | tr ' ' '\n' | grep / | tail -1 || true)"
+CANDIDATES=("${THMES_WEB_PYTHON:-}" "$HOME/.thmes-env/bin/python" "$HOME/.mlx-env/bin/python" "$shebang_py" python3 python)
+
+PY=""
+for p in "${CANDIDATES[@]}"; do
+  [ -n "$p" ] && command -v "$p" >/dev/null 2>&1 || continue
+  if "$p" -c "import websockets" 2>/dev/null; then PY="$p"; break; fi
+done
+
+if [ -z "$PY" ]; then
+  # No interpreter has websockets — install it into the first runnable candidate.
+  for p in "${CANDIDATES[@]}"; do
+    [ -n "$p" ] && command -v "$p" >/dev/null 2>&1 && { PY="$p"; break; }
+  done
+  [ -n "$PY" ] || { echo "thmes-web: no usable Python found."; exit 1; }
+  echo "thmes-web: 'websockets' missing — installing into $PY …"
+  "$PY" -m pip install --quiet websockets || {
+    echo "thmes-web: automatic install failed. Run:  $PY -m pip install websockets"; exit 1; }
+fi
+
+# ── Serve THIS checkout's CLI (not whatever `thmes` happens to be on PATH) ────────
+# server.py would otherwise prefer a PATH `thmes`, which on a dev box is the PUBLIC
+# build. Pin it to this repo's bin/thmes, run by the same (dep-complete) Python.
+export THMES_CMD="${THMES_CMD:-$PY $REPO/bin/thmes}"
 exec "$PY" "$REPO/web/server.py" "$@"
