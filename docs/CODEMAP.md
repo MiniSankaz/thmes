@@ -80,6 +80,7 @@ from `thmes`. **Changing any of those signatures requires updating both importer
 | `TOOL_RISK_TIER`, `_RISK_STYLE` | 484 / 493 | UI risk styling |
 | `_DANGEROUS_BASH_RE` | 501 | extra-risk bash detection |
 | File tools | 704–760 | `read_file` 704, `write_file` 708, `edit_file` 724, `delete_file` 745, `list_dir` 760 |
+| **Document extraction** | before `read_file` | `read_file` auto-extracts Office formats to text so small models can read real-world files. `_extract_document(p)` routes by suffix: `.xlsx/.xlsm`→`_xlsx_to_text` (sheets→TSV), `.pptx`→`_pptx_to_text` (slide text), `.docx`→`_docx_to_text` (paragraphs); plain-text/code/CSV read verbatim; unknown binary → honest note (no mojibake). Each extractor tries the optional lib (`openpyxl`/`python-pptx`/`python-docx`) then a **stdlib `zipfile`+`xml.etree` fallback** (`_xml_localname_text` strips namespaces) → no-dependency install still works. All on-machine → composes with local-only relay. `_PLAINTEXT_SUFFIXES`, `_DOC_EXTRACTORS`. |
 | `tool_grep` | 767 | |
 | `tool_bash` | 781 | 30s timeout. **Trailing `&`** → detaches with DEVNULL fds + returns fast (no pipe hang on a backgrounded server). **Timeout** → clean message + hint to use `&`, not a raised exception. + `_suggest_install_hint` 803, `tool_install_dep` 833 |
 | **Web tools** | | `tool_web_fetch` 1042, `tool_web_search` 1120 (DDGS, 5min cache) |
@@ -88,6 +89,7 @@ from `thmes`. **Changing any of those signatures requires updating both importer
 | `tool_opencode` | 1355 | delegates to `~/.opencode/bin/opencode`; gated by `_FLAGS["opencode_enabled"]` |
 | opencode maps | 1322–1339 | `OPENCODE_PRIMARY`, `OPENCODE_SUBAGENTS`, `SUBAGENT_PRIMARY_MAP` |
 | datetime/path tools | 571 / 643 | `tool_current_datetime`, `tool_current_directory` |
+| **Working dir (project root)** | 712–745 | `_WORKDIR` (global, = launch cwd) · `_set_workdir(path)` (validate dir → `os.chdir` + update global, keeps process cwd in lock-step) · `_resolve_path(path)` (relative paths hang off `_WORKDIR`; abs/`~` honoured) · `tool_set_workdir` (model-facing, risk `safe`). All file tools resolve via `_resolve_path`; `tool_bash` passes `cwd=str(_WORKDIR)`; `tool_python` runs in-process (inherits synced cwd). Slash: `/cd PATH`, `/pwd`. |
 | `tool_ask_user` | 665 | interactive question tool |
 | `tool_tasklist` | 1592 | in-TUI task list; `class TaskStore` 1479, `TASKS_DB` 1475 |
 | **`tool_make_report`** | before `TOOLS` | **built-in report tool** (stdlib-only). Markdown → styled self-contained HTML (or `.md`) under `THMES_HOME/reports/`; open + ⌘P → PDF. Helpers: `_md_to_html` (headings/tables/fences/lists/quotes), `_md_inline`, `_REPORT_CSS`, `_REPORT_HTML`. Risk: `safe`. |
@@ -111,10 +113,11 @@ from `thmes`. **Changing any of those signatures requires updating both importer
 | `_FORECAST_RE` | ~2004 | forward-looking markers (แนวโน้ม/คาดการณ์/มีโอกาส/ฟื้นตัว/forecast/outlook/…) — distinct from `_PA_FACTUAL_RE` (current value). Drives forecast-aware angles. |
 | `_extract_finance_entity` | 1975 | finance ticker/entity detect |
 | PA regexes | 1887–1949 | finance/tech/news/health/factual/compare/explain/opinion/task/chat detectors |
-| `smart_route` | 2716 | fast keyword path → LLM router fallback |
+| `smart_route` | 2716 | fast keyword path → LLM router fallback. Returns `{tools, agent, skills, added_by_keyword, fast_path, web}`. **Fast path skips when it matched ONLY a web tool** (`kw_has_web`) → defers the web-vs-local call to the LLM (a keyword like "ล่าสุด" is ambiguous: "ไฟล์ล่าสุด" local vs "ข่าวล่าสุด" web). Empty LLM tool selection → caller loads the FULL toolset (don't cripple the agent). |
 | `_keyword_augment` | 2702 | regex → tool union; returns (augmented, added). **REUSE pattern for query expansion** |
 | `TASK_KEYWORD_TOOLS` | 2637 | 13 (regex, [tools]) tuples (TH+EN) |
-| `ROUTER_PROMPT` / `ROUTER_JSON_RE` | 2499 / 2532 | LLM router prompt + output extractor |
+| `ROUTER_PROMPT` / `ROUTER_JSON_RE` | 2499 / 2532 | LLM router prompt + output extractor. **Emits a `web` bool** (does answering need current/external INTERNET info?) with TH+EN examples that "ไฟล์/commit/log ล่าสุด" is LOCAL even with a time word. (The web *trigger* uses tool-choice, not this bool — see §2.6.) |
+| `_LOCAL_INTENT_TOOLS` | ~2575 | `{read_file, write_file, edit_file, delete_file, list_dir, grep, bash, python, current_directory, set_workdir, opencode, install_dep}` — if the router picks any of these, a co-selected `web_search` is just a fallback, NOT a web-research signal. |
 | `_compact_index` | 2534 | compact tool/agent/skill index for router |
 | `_detect_continuity` | 2585 | continue-vs-new-topic detection; `_CONTINUE_RE` 2566, `_NEW_TOPIC_RE` 2575 |
 
@@ -128,9 +131,10 @@ from `thmes`. **Changing any of those signatures requires updating both importer
 | `_run_and_present_research(...)` | 4842 | run controller + print + persist + append to history (shared by auto path) |
 | `_detect_uncertainty(reply)` | 2607 | TH+EN knowledge-gap phrase detector on a DRAFT → triggers research. `_UNCERTAINTY_RE` 2588 |
 | `_extract_domains(text)` | 1126 | pull unique domains from tool output (coverage measure). `_URL_IN_TEXT_RE` 1123 |
-| `_RESEARCH_TRIGGER_RE` | 2569 | factual/current-info keyword trigger (TH+EN) — pre-emptive path |
+| `_RESEARCH_TRIGGER_RE` | 2569 | factual/current-info keyword trigger (TH+EN). **NO LONGER the primary decider** — it's only the FALLBACK for when the router didn't run (auto_load off). |
+| **auto-research trigger (LLM-driven)** | main loop ~7997 | `research_triggered` now keys off the ROUTER's tool picks, not a regex: `_needs_web = (web_search/web_fetch picked) AND NOT (any `_LOCAL_INTENT_TOOLS` picked)`. So "ตอนนี้ใน folder เห็นไฟล์อะไร"→[list_dir]→local; "ราคาทองวันนี้"→[web_search]→web; "ไฟล์ล่าสุด"→[list_dir,bash,web_search]→local (web_search is a fallback the agent loop still has). The standalone `web` bool is intentionally NOT used to trigger (noisy: small models mislabel it, big models over-include web_search). Validated by a 206-case TH/EN stress test on e2b + typhoon2.5. |
 | `/research` handler | 5559 | `/research QUERY [--depth N] [--rounds N]` and `/research auto on|off` → **uses `run_research_loop`** |
-| auto-trigger sites | ~5922 (pre-emptive), post-draft uncertainty block after quality-check | keyword query → research before drafting; uncertain draft → research then rewrite |
+| auto-trigger sites | ~7997 (pre-emptive, router-driven), post-draft uncertainty block after quality-check | router says web → research before drafting; uncertain draft → research then rewrite |
 | `_FLAGS` research keys | 216–230 | `research_auto`, `research_depth` (3), `research_rounds` (3), `research_kw_llm` (True). Env: `THMES_RESEARCH_{AUTO,DEPTH,ROUNDS,KW_LLM,CORPUS,ANSWER_TOKENS}` |
 | `_research_system_block` / `_research_hint_block` | 3542 / 3616 | LEGACY prompt blocks — no longer the engine (controller replaced them); kept for reference/fallback |
 | `_plan_system_block` / `_parse_plan_steps` / `_PLAN_TRIGGER_RE` | 3536 / 3551 / ~3524 | `/plan` mode; `_FLAGS["plan_auto"]` |
@@ -187,7 +191,7 @@ from `thmes`. **Changing any of those signatures requires updating both importer
 | `_enter_relay_mode` / `_cloud_smoke_test` / `_pick_cloud_model` / `_discover_cloud_models` / `_resolve_relay_cloud` | mode entry: resolve/pick cloud → smoke-test → on+persist, else **kick back to default**. Refuses if active model is itself cloud. |
 | `_relay_ensure_vault(session_id)` | one MaskVault per session; auto-clears on session switch (vault never crosses sessions). |
 | `_relay_settings_load/_save` | persist `cloud_model`/`deny_list`/`groups` → `THMES_HOME/data/relay.json` (bin/thmes stays lib-import-free except the soft `thmes_mask` import). |
-| main-loop hook | `if _FLAGS["relay_mode"]:` block **before** `research_triggered` — takes precedence, `continue`s on success, falls through to local `agent_turn` on abort. **Branches on `relay_tools`**: on → `_run_and_present_relay_agent` (agentic), off → `_run_and_present_mask` (one-shot). |
+| main-loop hook | `if _FLAGS["relay_mode"]:` block **before** `research_triggered` — takes precedence, `continue`s on success, falls through to local `agent_turn` on abort. **3-way branch:** `relay_local` → `_run_and_present_relay_local` (local-only, precedence), elif `relay_tools` → `_run_and_present_relay_agent` (agentic), else → `_run_and_present_mask` (one-shot). |
 | `_RELAY_SYS` | cloud system prompt: "copy `__PII_*__` placeholders verbatim, never alter". |
 
 ### ★★ Agentic relay (sub-mode, added 2026-06-18) — cloud = brain, local = hands
@@ -199,7 +203,7 @@ from `thmes`. **Changing any of those signatures requires updating both importer
 
 | Symbol | Notes |
 |---|---|
-| `run_relay_agent_loop(history, *, cloud_model, vault, tools_on, allow_dangerous, max_tokens, ner_fn, agent_system, max_iters, gather_files, on_event)` | THE agentic controller. Masks the starting payload → leak-guard → loop: `generate_reply(model=cloud, tools=schema, think=False)` → `parse_tool_calls` → for each call `_relay_unmask_args` → `execute_tool` (real args, real approval) → `_relay_mask_result` → feed `<tool_result>` back. Vault accumulates across rounds (consistent placeholders). Returns `(final, meta)`; `final=None` on initial leak / first-round cloud fail → caller falls back local. After `max_iters`, one tools-free synthesis round. Schema gating does NOT depend on `mm.backend` (cloud always over Ollama HTTP via `model=`). **Empty-turn nudge** (`MAX_EMPTY_NUDGES=3`): a stall (`""`, NOT `[ollama …]`) mid-chain → inject a `(continue)` nudge instead of aborting the tool chain (small models stall mid-task; mirrors `agent_turn`). |
+| `run_relay_agent_loop(history, *, cloud_model, vault, tools_on, allow_dangerous, max_tokens, ner_fn, agent_system, max_iters, gather_files, on_event)` | THE agentic controller. Masks the starting payload → leak-guard → loop: `generate_reply(model=cloud, tools=schema, think=False)` → `parse_tool_calls` → for each call `_relay_unmask_args` → `execute_tool` (real args, real approval) → `_relay_mask_result` → feed `<tool_result>` back. Vault accumulates across rounds (consistent placeholders). Returns `(final, meta)`; `final=None` on initial leak / first-round cloud fail → caller falls back local. After `max_iters`, one tools-free synthesis round. Schema gating does NOT depend on `mm.backend` (cloud always over Ollama HTTP via `model=`). **Empty-turn nudge** (`MAX_EMPTY_NUDGES=3`): a stall (`""`, NOT `[ollama …]`) mid-chain → inject a `(continue)` nudge instead of aborting the tool chain (small models stall mid-task; mirrors `agent_turn`). **Action-narration nudge** (`MAX_ACTION_NUDGES=3`, `_RELAY_PLANNING_RE`): a no-tool-call turn whose text reads like an unfinished plan ("we need to write …", "จะเขียน") → nudge to EMIT the call instead of accepting the narration as the final answer — stops thinking cloud models (gpt-oss/qwen3-coder) from ending a multi-step read→process→write task after just narrating the next step. |
 | `_relay_unmask_args(value, vault)` | recursively restore placeholders in a cloud-issued call's args (nested dict/list) so LOCAL exec uses real path/content/command. |
 | `_relay_mask_result(result, vault, *, run_ner)` | re-mask a tool result + leak_scan; if a high-risk secret survives masking → **redact whole result** (work already ran locally, cloud just doesn't see raw output). Returns `(safe_text, redacted_bool)`. NER only on `_RELAY_NER_RESULT_TOOLS` (read/grep/list/web_*). |
 | `_run_and_present_relay_agent` | presenter: run loop + per-tool banner (`on_event`) + persist UNMASKED to local session + counts/tool-calls/iters/redacted summary. |
@@ -232,6 +236,22 @@ REAL action (informed consent) · whole payload masked (system+history) · unmas
 deterministic exact-replace · leak-scan runs ALL rules even for disabled groups · vault
 in-RAM/session-scoped, never on disk · UI shows counts+categories, real values only
 behind `relay_show_values`/`-v`.
+
+### ★★ Local-only relay (sub-mode, added 2026-06-22) — cloud = DIRECTOR, local = hands+eyes
+> Opt-in via `/relay local on` (flag `relay_local`, default OFF; **precedence over
+> `relay_tools`** in the main-loop hook). Strongest privacy posture: unlike agentic relay
+> (masked tool RESULTS go to the cloud), here **no file content reaches the cloud at all —
+> not even masked**. The cloud emits ONE plain-text step at a time and only ever reads a
+> short, content-free status line back; the LOCAL model (`mm`) does every read/edit/run on
+> REAL data via `agent_turn`. Use when the local model can EXECUTE concrete steps but can't
+> PLAN well — cloud supplies reasoning, local supplies the hands+eyes.
+
+| Symbol | Notes |
+|---|---|
+| `run_relay_local_loop(history, *, cloud_model, vault, tools_on, allow_dangerous, max_tokens, ner_fn, agent_system, max_iters, on_event)` | THE local-only controller. Mask the task → leak-guard (only the masked task + planner sys ever leave) → loop: cloud `generate_reply(model=cloud, no tools)` emits one directive → `DONE:`-prefixed ⇒ unmask+return; else `vault.unmask` the directive → `agent_turn` runs it locally on real data (own running `local_history`, never sent up) → `_relay_local_status` distils a masked one-liner back to cloud. After `max_iters`, one final director turn for a `DONE:` summary. Returns `(final, meta)`; `final=None` on initial leak / first-round cloud fail → caller falls back local. |
+| `_relay_local_status(local_reply, vault, *, ner_fn)` | LOCAL model distils the (long, content-bearing) executor reply → ONE abstract status line (`_RELAY_LOCAL_STATUS_PROMPT`), then mask + leak_scan; any risky survivor → generic "[kept on-machine]" marker so no content rides up inside the status. |
+| `_RELAY_LOCAL_SYS` | director system-prompt: "you NEVER see file contents, only status reports; emit one imperative step, or a `DONE:` line when complete; never ask for contents; keep placeholders verbatim". |
+| `_run_and_present_relay_local` | presenter: run loop + per-step/status banner (`on_event`) + persist UNMASKED summary to local session + steps/local-tool-calls/masked-counts summary. |
 
 ---
 
@@ -291,13 +311,13 @@ Pure, MLX-free, unit-testable. Powers the `/relay` privacy proxy (see §2.10).
 
 ---
 
-## 4. Agents (agents/<name>/, 12 agents × 5 JSON files)
+## 4. Agents (agents/<name>/, 14 agents × 4 JSON files)
 
 Each bundle = **5 files**: `identity.json`, `capabilities.json`, `safeguards.json`,
-`config.json`, `system-prompt.txt` (verified — all 12 dirs have exactly 5).
+`config.json`, `system-prompt.txt` (verified — all 14 dirs have exactly 5).
 `load_agents()` silently skips a dir if any of the 5 is missing/invalid JSON.
-Agents: analyst, architect, backend-dev, data-engineer, debugger,
-doc-writer, financial, frontend-dev, git-ops, research, reviewer, tester.
+Agents: analyst, architect, backend-dev, ctx-manager, data-engineer, debugger,
+doc-writer, financial, frontend-dev, git-ops, ops, research, reviewer, tester.
 Loaded by `load_agents()` (thmes:277), prefers `~/.thmes/agents/`.
 
 ---
@@ -382,8 +402,11 @@ only three judgment tasks: drafting, proposing keywords, and final synthesis.
 
 **Three entry paths, all → `run_research_loop`:**
 1. **Explicit** `/research QUERY [--depth N] [--rounds N]` (handler 5559).
-2. **Pre-emptive auto** (~5922): a fresh message matching `_RESEARCH_TRIGGER_RE`
-   (current-info/factual) → research immediately (skip drafting from stale memory).
+2. **Pre-emptive auto** (~7997): **router-driven** — fires when the LLM router picked a
+   web tool (`web_search`/`web_fetch`) and NO local/file tool (`_LOCAL_INTENT_TOOLS`) →
+   research immediately (skip drafting from stale memory). `_RESEARCH_TRIGGER_RE` is only
+   the fallback when the router didn't run. (Was a pure keyword regex pre-2026-06-22;
+   changed so a local "ไฟล์ล่าสุด" isn't forced to web by the word "ล่าสุด".)
 3. **Uncertain-draft auto** (post-quality-check block): model drafts → if
    `_detect_uncertainty(reply)` fires (no tool calls, factual intent) → research and
    rewrite the answer. This is the "ถ้าไม่รู้ → ไปค้นก่อน" mechanism.

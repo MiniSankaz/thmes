@@ -100,6 +100,11 @@ from rich.syntax import Syntax
 # ╔════════════════════════════════════════════════════════════════════════╗
 # ║ Config                                                                ║
 # ╚════════════════════════════════════════════════════════════════════════╝
+# Bump on user-visible changes. Shown in the startup banner + live header so you
+# always know which build is running. v0.4.0 = local-only relay + working dir +
+# Office-doc reading + Ollama-first default + relay action-nudge.
+VERSION = "0.4.1"
+
 MODELS = {
     "gemma":   "mlx-community/gemma-4-e4b-it-4bit",
     "qwen-vl": "mlx-community/Qwen3-VL-8B-Instruct-4bit",
@@ -118,6 +123,9 @@ def _env(key: str, default=None):
 
 
 DEFAULT_MODEL = _env("THMES_MODEL", "qwen-vl")
+# Did the user pin a model explicitly? If not, startup prefers an available Ollama
+# model over the MLX default (Ollama is the primary backend on most machines).
+_THMES_MODEL_EXPLICIT = os.environ.get("THMES_MODEL") is not None
 DEFAULT_MAX_TOKENS = int(_env("THMES_MAX_TOKENS", "2048"))
 COMPACT_THRESHOLD = float(_env("THMES_COMPACT_PCT", "0.6"))  # auto-compact at 60% of native
 
@@ -273,6 +281,14 @@ _FLAGS = {
     # are unmasked just-in-time so exec uses real values (and the approval prompt
     # shows the real action). Toggle: /relay tools on|off.
     "relay_tools":         _env("THMES_RELAY_TOOLS", "0").lower() in ("1","true","yes","on"),
+    # Local-only relay (opt-in sub-mode, takes precedence over relay_tools when on):
+    # the CLOUD is a DIRECTOR that never sees file contents — it emits one plain-text
+    # step at a time and only ever receives short, content-free status reports. The
+    # LOCAL model executes every step with full tools on REAL data in the working dir.
+    # Result: file content NEVER leaves the machine (not even masked). Best when the
+    # local model is too small to PLAN well but fine at carrying out concrete steps —
+    # cloud supplies the reasoning, local supplies the hands+eyes. Toggle: /relay local on|off.
+    "relay_local":         _env("THMES_RELAY_LOCAL", "0").lower() in ("1","true","yes","on"),
     "relay_max_iters":     int(_env("THMES_RELAY_MAX_ITERS", "6") or 6),
     # Self-heal: after the agentic loop, run this verify command; on failure the LOCAL
     # model triages the raw error and the (masked) error+diagnosis is fed back to the
@@ -330,6 +346,12 @@ except Exception:
     _MASK_OK = False
     DEFAULT_GROUPS = _RELAY_DEFAULT_GROUPS
 RELAY_SETTINGS_FILE = THMES_HOME / "data" / "relay.json"
+
+# Adaptive tool-calling: per-model choice of native function-calling vs the
+# inline-text protocol. `auto` calibrates each model once (cached on disk);
+# `native`/`text` force one mode for every model.
+TOOL_MODE_FILE = THMES_HOME / "data" / "tool_mode.json"
+_TOOL_MODE_OVERRIDE = (_env("THMES_TOOL_MODE", "auto") or "auto").strip().lower()
 
 console = Console()
 
@@ -554,6 +576,7 @@ def run_skill_agentic(skill_name: str, skill_data: dict, user_task: str,
 TOOL_RISK = {"read_file": "safe", "list_dir": "safe", "grep": "safe",
              "web_search": "safe", "web_fetch": "safe",
              "current_datetime": "safe", "current_directory": "safe",
+             "set_workdir": "safe",
              "ask_user": "safe", "tasklist": "safe", "make_report": "safe",
              "write_file": "ask", "edit_file": "ask", "delete_file": "ask", "bash": "ask",
              "python": "ask", "opencode": "ask",
@@ -682,8 +705,8 @@ def tool_current_datetime(format: str = "default") -> str:
 # ║ Models trained on public corpora memorize specific usernames (often   ║
 # ║ /Users/<original-dev>/) and will write to those paths verbatim even   ║
 # ║ when running on a machine where that user does NOT exist. We've seen  ║
-# ║ models attempt `/Users/<other>/Desktop/...` on a machine whose user   ║
-# ║ is different. Two-layer fix mirroring the datetime pattern:           ║
+# ║ models attempt `/home/you/Desktop/...` on a machine whose user is ║
+# ║ `youruser`. Two-layer fix mirroring the datetime pattern:              ║
 # ║   1. Always-on context block listing the real cwd/home/Desktop paths  ║
 # ║   2. `current_directory` tool for mid-turn lookup                     ║
 # ║   3. Defensive guard in tool_write_file rejecting other-user homes   ║
@@ -691,12 +714,55 @@ def tool_current_datetime(format: str = "default") -> str:
 # ╚════════════════════════════════════════════════════════════════════════╝
 PATH_AWARE = _env("THMES_PATH_AWARE", "1").lower() in ("1","true","yes","on")
 
+# ╔════════════════════════════════════════════════════════════════════════╗
+# ║ Working directory (project root)                                       ║
+# ║ thmes anchors all relative file work to a single "project root". It    ║
+# ║ defaults to the directory thmes was LAUNCHED from (process cwd) and is  ║
+# ║ changeable at runtime via `/cd`, `/pwd`, or the `set_workdir` tool.     ║
+# ║ Source of truth is `_WORKDIR`; `_set_workdir()` keeps the process cwd  ║
+# ║ in lock-step (os.chdir) so relative paths, grep globs, and subprocess  ║
+# ║ children (bash/python) all resolve against the same root for free.     ║
+# ╚════════════════════════════════════════════════════════════════════════╝
+_WORKDIR: Path = Path.cwd()           # project root — launch dir until /cd changes it
+
+
+def _set_workdir(path: str) -> tuple[bool, str]:
+    """Change the project root. Validates the target is an existing directory,
+    then os.chdir + updates `_WORKDIR`. Returns (ok, message)."""
+    global _WORKDIR
+    try:
+        p = Path(path).expanduser()
+        if not p.is_absolute():
+            p = _WORKDIR / p          # resolve relative to the CURRENT root
+        p = p.resolve()
+    except Exception as e:
+        return False, f"bad path: {type(e).__name__}: {e}"
+    if not p.exists():
+        return False, f"ไม่พบ path: {p}"
+    if not p.is_dir():
+        return False, f"ไม่ใช่ directory: {p}"
+    try:
+        os.chdir(p)
+    except Exception as e:
+        return False, f"chdir ล้มเหลว: {type(e).__name__}: {e}"
+    _WORKDIR = p
+    return True, str(p)
+
+
+def _resolve_path(path: str) -> Path:
+    """Resolve a user/model-supplied path against the project root. Absolute
+    paths and ~ are honoured verbatim; bare relative paths hang off `_WORKDIR`."""
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = _WORKDIR / p
+    return p
+
 
 def current_path_snapshot() -> dict:
     """Single source of truth for filesystem context."""
     home = Path.home()
     return {
-        "cwd":       os.getcwd(),
+        "cwd":       str(_WORKDIR),
         "home":      str(home),
         "user":      os.environ.get("USER", "") or home.name,
         "shell":     os.environ.get("SHELL", ""),
@@ -715,12 +781,13 @@ def current_path_context() -> str:
         "[Filesystem context — use ONLY these real paths. Never write to "
         "`/Users/<other-name>/...` invented from training data — those paths "
         "do not exist on this machine.]\n"
-        f"  Current dir  : {s['cwd']}\n"
+        f"  Working dir (project root) : {s['cwd']}\n"
         f"  Home (~)     : {s['home']}  (user: {s['user']})\n"
         f"  Desktop      : {s['desktop']}\n"
         f"  Downloads    : {s['downloads']}\n"
         f"  Documents    : {s['documents']}\n"
         f"  Scratch      : {s['tmp']}\n"
+        f"Relative paths (e.g. `src/app.py`) resolve under the working dir above. "
         f"Prefer `~/...` (auto-expands) or absolute paths under {s['home']}."
     )
 
@@ -737,7 +804,7 @@ def tool_current_directory(format: str = "default") -> str:
     if fmt == "json":
         return json.dumps(s, ensure_ascii=False, indent=2)
     return (
-        f"cwd       : {s['cwd']}\n"
+        f"workdir   : {s['cwd']}  (project root — relative paths resolve here)\n"
         f"home (~)  : {s['home']}\n"
         f"user      : {s['user']}\n"
         f"desktop   : {s['desktop']}\n"
@@ -745,6 +812,14 @@ def tool_current_directory(format: str = "default") -> str:
         f"documents : {s['documents']}\n"
         f"tmp       : {s['tmp']}"
     )
+
+
+def tool_set_workdir(path: str) -> str:
+    """Change the project root (working directory). All later relative file
+    paths and shell/python commands resolve against it. Use an absolute path,
+    `~/...`, or a path relative to the current root."""
+    ok, msg = _set_workdir(path)
+    return f"working dir → {msg}" if ok else f"Error: {msg}"
 
 
 def tool_ask_user(question: str) -> str:
@@ -786,14 +861,183 @@ def _validate_user_path(p: Path) -> Optional[str]:
     return None
 
 
+# ── Document extraction — let read_file work on real-world office files ──────────
+# Small local models can't parse a raw xlsx/pptx (they're ZIP+XML, not text). So the
+# TOOL does the extraction locally and hands the model clean text. Optional libs
+# (openpyxl / python-pptx / python-docx) are used when present; otherwise a stdlib
+# zipfile+XML fallback keeps the no-dependency install working on every machine.
+# Everything runs ON-MACHINE → pairs with local-only relay (content never leaves).
+_PLAINTEXT_SUFFIXES = {
+    ".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".tsv", ".json", ".jsonl",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env", ".xml", ".html", ".htm",
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".sh", ".bash", ".zsh", ".go", ".java", ".rs",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".css", ".scss", ".sql", ".rb", ".php", ".pl",
+    ".lua", ".r", ".swift", ".kt", ".gradle", ".properties", ".tf", ".dockerfile",
+}
+
+
+def _xml_localname_text(data: bytes, *, tags: set) -> list:
+    """Pull text from every element whose local tag name (namespace stripped) is in
+    `tags`, in document order. Robust to the differing namespaces across office XML."""
+    import xml.etree.ElementTree as ET
+    out = []
+    try:
+        root = ET.fromstring(data)
+    except Exception:
+        return out
+    for el in root.iter():
+        tag = el.tag.rsplit("}", 1)[-1]   # strip '{namespace}'
+        if tag in tags and el.text:
+            out.append(el.text)
+    return out
+
+
+def _xlsx_to_text(p: Path) -> str:
+    """Extract an .xlsx as TSV-ish text (one sheet block per worksheet)."""
+    try:
+        import openpyxl                                  # preferred: real cell model
+        wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+        blocks = []
+        for ws in wb.worksheets:
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                cells = ["" if c is None else str(c) for c in row]
+                if any(cells):
+                    rows.append("\t".join(cells))
+            if rows:
+                blocks.append(f"# Sheet: {ws.title}\n" + "\n".join(rows))
+        return "\n\n".join(blocks) if blocks else "[xlsx: no cell data]"
+    except ImportError:
+        pass                                              # lib absent → stdlib fallback
+    except Exception:
+        pass                                              # lib present but file broke → try stdlib
+    # stdlib fallback: resolve sharedStrings then read each sheet's cells in row order.
+    import zipfile, re as _re
+    import xml.etree.ElementTree as ET
+    try:
+        with zipfile.ZipFile(p) as z:
+            shared = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                shared = _xml_localname_text(z.read("xl/sharedStrings.xml"), tags={"t"})
+            sheets = sorted(n for n in z.namelist()
+                            if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
+            blocks = []
+            for sn in sheets:
+                root = ET.fromstring(z.read(sn))
+                rows = []
+                for row in root.iter():
+                    if row.tag.rsplit("}", 1)[-1] != "row":
+                        continue
+                    cells = []
+                    for c in row:
+                        if c.tag.rsplit("}", 1)[-1] != "c":
+                            continue
+                        t = c.get("t")
+                        v = "".join(_xml_localname_text(ET.tostring(c), tags={"v", "t"}))
+                        if t == "s" and v.isdigit() and int(v) < len(shared):
+                            v = shared[int(v)]
+                        cells.append(v)
+                    if any(cells):
+                        rows.append("\t".join(cells))
+                if rows:
+                    blocks.append(f"# Sheet: {sn.split('/')[-1]}\n" + "\n".join(rows))
+            return "\n\n".join(blocks) if blocks else "[xlsx: no cell data]"
+    except Exception as e:
+        return f"[xlsx extract failed: {type(e).__name__}: {e}]"
+
+
+def _pptx_to_text(p: Path) -> str:
+    """Extract a .pptx slide-by-slide (titles + body text runs)."""
+    try:
+        from pptx import Presentation                    # preferred: real shape model
+        prs = Presentation(str(p))
+        blocks = []
+        for i, slide in enumerate(prs.slides, 1):
+            runs = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        line = "".join(r.text for r in para.runs).strip()
+                        if line:
+                            runs.append(line)
+            if runs:
+                blocks.append(f"# Slide {i}\n" + "\n".join(runs))
+        return "\n\n".join(blocks) if blocks else "[pptx: no text]"
+    except ImportError:
+        pass                                              # lib absent → stdlib fallback
+    except Exception:
+        pass                                              # lib present but file broke → try stdlib
+    # stdlib fallback: ppt/slides/slideN.xml → <a:t> text runs, slides in numeric order.
+    import zipfile, re as _re
+    try:
+        with zipfile.ZipFile(p) as z:
+            names = [n for n in z.namelist()
+                     if _re.match(r"ppt/slides/slide\d+\.xml$", n)]
+            names.sort(key=lambda n: int(_re.search(r"(\d+)", n).group(1)))
+            blocks = []
+            for i, n in enumerate(names, 1):
+                runs = [t for t in _xml_localname_text(z.read(n), tags={"t"}) if t.strip()]
+                if runs:
+                    blocks.append(f"# Slide {i}\n" + "\n".join(runs))
+            return "\n\n".join(blocks) if blocks else "[pptx: no text]"
+    except Exception as e:
+        return f"[pptx extract failed: {type(e).__name__}: {e}]"
+
+
+def _docx_to_text(p: Path) -> str:
+    """Extract a .docx as paragraph text."""
+    try:
+        import docx                                      # preferred
+        d = docx.Document(str(p))
+        lines = [para.text for para in d.paragraphs if para.text.strip()]
+        return "\n".join(lines) if lines else "[docx: no text]"
+    except ImportError:
+        pass                                              # lib absent → stdlib fallback
+    except Exception:
+        pass                                              # lib present but file broke → try stdlib
+    import zipfile                                       # stdlib fallback: word/document.xml <w:t>
+    try:
+        with zipfile.ZipFile(p) as z:
+            runs = _xml_localname_text(z.read("word/document.xml"), tags={"t"})
+            text = "".join(runs)
+            return text if text.strip() else "[docx: no text]"
+    except Exception as e:
+        return f"[docx extract failed: {type(e).__name__}: {e}]"
+
+
+_DOC_EXTRACTORS = {".xlsx": _xlsx_to_text, ".xlsm": _xlsx_to_text,
+                   ".pptx": _pptx_to_text, ".docx": _docx_to_text}
+
+
+def _extract_document(p: Path) -> str:
+    """Return clean text for a file the model wants to read. Office formats (xlsx/
+    pptx/docx) are extracted locally; plain-text/code/csv are read verbatim. A binary
+    file with no extractor returns a short, honest note rather than mojibake."""
+    suffix = p.suffix.lower()
+    if suffix in _DOC_EXTRACTORS:
+        return _DOC_EXTRACTORS[suffix](p)
+    try:
+        return p.read_text()
+    except (UnicodeDecodeError, ValueError):
+        if suffix in _PLAINTEXT_SUFFIXES:
+            return p.read_text(errors="replace")         # best-effort for declared text
+        return (f"[binary file ({suffix or 'no ext'}, {p.stat().st_size:,} bytes) — not "
+                f"UTF-8 text and no extractor for this type. Supported document "
+                f"extractors: {', '.join(sorted(_DOC_EXTRACTORS))}. For other binaries "
+                f"use a shell tool (e.g. `file`, `pdftotext`) instead.]")
+
+
 def tool_read_file(path: str) -> str:
-    p = Path(path).expanduser()
-    return _truncate(p.read_text())
+    """Read a file as text. CSV/code/text are returned verbatim; Office documents
+    (.xlsx/.xlsm, .pptx, .docx) are extracted to clean text locally so the model can
+    work with their content. Returns an honest note for unsupported binaries."""
+    p = _resolve_path(path)
+    return _truncate(_extract_document(p))
 
 def tool_write_file(path: str, content: str, mode: str = "w") -> str:
     """Write or append to a file.  mode='w' overwrites (default); mode='a' appends.
     Use mode='a' to build large files in chunks — call write_file multiple times."""
-    p = Path(path).expanduser()
+    p = _resolve_path(path)
     err = _validate_user_path(p)
     if err:
         return f"Error: {err}"
@@ -810,7 +1054,7 @@ def tool_edit_file(path: str, old_str: str, new_str: str) -> str:
     """Replace the FIRST occurrence of old_str with new_str in a file.
     Read the file first to get exact text; the match is literal (not regex).
     Use write_file when rewriting large sections; use edit_file for small targeted changes."""
-    p = Path(path).expanduser()
+    p = _resolve_path(path)
     err = _validate_user_path(p)
     if err:
         return f"Error: {err}"
@@ -829,7 +1073,7 @@ def tool_edit_file(path: str, old_str: str, new_str: str) -> str:
 
 def tool_delete_file(path: str) -> str:
     """Delete a single file. Refuses directories (use bash for recursive removal)."""
-    p = Path(path).expanduser()
+    p = _resolve_path(path)
     err = _validate_user_path(p)
     if err:
         return f"Error: {err}"
@@ -843,14 +1087,14 @@ def tool_delete_file(path: str) -> str:
     return f"deleted {p} ({size:,} bytes)"
 
 def tool_list_dir(path: str = ".") -> str:
-    p = Path(path).expanduser()
+    p = _resolve_path(path)
     items = []
     for e in sorted(p.iterdir()):
         items.append(f"{'d' if e.is_dir() else 'f'} {e.name}")
     return "\n".join(items)
 
 def tool_grep(pattern: str, path: str = ".") -> str:
-    p = Path(path).expanduser()
+    p = _resolve_path(path)
     results = []
     for f in p.rglob("*") if p.is_dir() else [p]:
         if not f.is_file(): continue
@@ -871,7 +1115,7 @@ def tool_bash(command: str) -> str:
     # agent can move on to probing the server.
     if command.rstrip().endswith("&"):
         try:
-            subprocess.Popen(command, shell=True,
+            subprocess.Popen(command, shell=True, cwd=str(_WORKDIR),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              stdin=subprocess.DEVNULL, start_new_session=True)
         except Exception as e:
@@ -881,7 +1125,7 @@ def tool_bash(command: str) -> str:
                 "captured here; redirect inside the command (e.g. '> server.log "
                 "2>&1') and read that file to inspect it.]\n[exit 0]")
     try:
-        r = subprocess.run(command, shell=True, capture_output=True,
+        r = subprocess.run(command, shell=True, cwd=str(_WORKDIR), capture_output=True,
                            text=True, timeout=30)
     except subprocess.TimeoutExpired as e:
         partial = (e.stdout or "") + (e.stderr or "")
@@ -1909,7 +2153,10 @@ def tool_make_report(title: str, content: str, format: str = "html") -> str:
 
 TOOLS = {
     "read_file": {"fn": tool_read_file, "params": {"path": "str"},
-                  "desc": "Read a file's text content"},
+                  "desc": ("Read a file's text content. Handles plain text/code/CSV "
+                           "verbatim AND auto-extracts Office documents to text: "
+                           ".xlsx/.xlsm (sheets→rows), .pptx (slide text), .docx "
+                           "(paragraphs). Just pass the path — no manual conversion.")},
     "write_file": {"fn": tool_write_file,
                    "params": {"path": "str", "content": "str", "mode": "str"},
                    "desc": "Write text to a file. mode='w' overwrites (default), mode='a' appends. "
@@ -2002,6 +2249,14 @@ TOOLS = {
                  "— call this tool only if you need to verify or get JSON. "
                  "NEVER invent /Users/<name>/ paths from memory."),
     },
+    "set_workdir": {
+        "fn": tool_set_workdir,
+        "params": {"path": "str — absolute, ~/..., or relative to current root"},
+        "desc": ("Change the project root (working directory). Afterwards, all "
+                 "relative file paths and shell/python commands resolve against "
+                 "it. USE WHEN the task targets a specific project/folder — set it "
+                 "once up front, then use short relative paths."),
+    },
     "ask_user": {
         "fn": tool_ask_user,
         "params": {"question": "str — one specific clarifying question"},
@@ -2051,6 +2306,13 @@ WEB ACCESS DISCIPLINE:
   • Only call web_fetch when you ALREADY have a specific real URL
     (from web_search results or the user's message).
   • placeholder domains (example.com, test.com) are blocked and will fail.
+
+WHEN NOT TO CALL A TOOL:
+  • Greetings, thanks, acknowledgements ("ok", "got it", "merge it", "noted"),
+    approvals, or coordination about our work with NO concrete new action
+    → reply in plain text and call NO tool.
+  • Call a tool only when the user asks for a real action on local
+    files/folders/commands/this machine, or for current external information.
 
 Available tools:
 {tools_json}
@@ -2837,23 +3099,28 @@ AVAILABLE SKILLS (pick 0-2 workflow guides):
 {skills}
 
 Output EXACTLY this JSON, nothing else:
-{{"tools":["name",...], "agent":"name_or_null", "skills":["name",...]}}
+{{"tools":["name",...], "agent":"name_or_null", "skills":["name",...], "web":true_or_false}}
+
+"web" = does answering this REQUIRE current/external info from the INTERNET?
+  • true  → NEWS, PRICES, WEATHER, STOCKS, world facts, public web pages.
+  • false → anything about THIS machine (files, folders, paths, project/repo, git, logs),
+            local files, code, math, or general reasoning. A time word like
+            "ตอนนี้/ล่าสุด/now/today" about a FILE/COMMIT/LOG is still local (web:false).
 
 Examples:
-  Task "list files in /tmp" → {{"tools":["list_dir"], "agent":null, "skills":[]}}
-  Task "read /etc/hosts" → {{"tools":["read_file"], "agent":null, "skills":[]}}
-  Task "อ่านรูปนี้" → {{"tools":[], "agent":null, "skills":[]}}
-  Task "ค้นหาข่าว AI ล่าสุด" → {{"tools":["web_search"], "agent":null, "skills":[]}}
-  Task "fetch https://github.com/X/Y/README" → {{"tools":["web_fetch"], "agent":null, "skills":[]}}
-  Task "what is the price of bitcoin today" → {{"tools":["web_search"], "agent":null, "skills":[]}}
-  Task "สร้าง HTML แสดง infographic" → {{"tools":["opencode"], "agent":"frontend-dev", "skills":["implement"]}}
-  Task "implement REST API for users" → {{"tools":["opencode"], "agent":"backend-dev", "skills":["implement"]}}
-  Task "fix bug in src/app.py" → {{"tools":["opencode","read_file"], "agent":"debugger", "skills":["debug"]}}
+  Task "ตอนนี้ใน folder มีไฟล์อะไรบ้าง" → {{"tools":["list_dir"], "agent":null, "skills":[], "web":false}}
+  Task "ไฟล์ล่าสุดที่ถูกแก้คือไฟล์ไหน" → {{"tools":["list_dir","bash"], "agent":null, "skills":[], "web":false}}
+  Task "list files in /tmp" → {{"tools":["list_dir"], "agent":null, "skills":[], "web":false}}
+  Task "สรุปไฟล์ report.xlsx นี้" → {{"tools":["read_file"], "agent":null, "skills":[], "web":false}}
+  Task "ค้นหาข่าว AI ล่าสุด" → {{"tools":["web_search"], "agent":null, "skills":[], "web":true}}
+  Task "what is the price of bitcoin today" → {{"tools":["web_search"], "agent":null, "skills":[], "web":true}}
+  Task "fix bug in src/app.py" → {{"tools":["opencode","read_file"], "agent":"debugger", "skills":["debug"], "web":false}}
 
 RULES:
-  1. For long file content (HTML/code/scripts) → PREFER "opencode" tool.
-  2. To find info on the web → use "web_search" FIRST (DO NOT guess URLs).
-  3. "web_fetch" only when a SPECIFIC URL is already known.
+  1. Local files/folders/paths/git/logs/this project → "list_dir"/"read_file"/"grep"/"bash", web:false.
+  2. NEWS / PRICES / WEATHER / STOCKS / world facts → "web_search", web:true.
+  3. For long file content (HTML/code/scripts) → PREFER "opencode" tool.
+  4. "web_fetch" only when a SPECIFIC URL is already known.
 """
 
 ROUTER_JSON_RE = re.compile(r'\{[^{}]*"tools"\s*:.*?\}', re.DOTALL)
@@ -2879,6 +3146,12 @@ _RESEARCH_TRIGGER_RE = re.compile(
     r"|trend|แนวโน้ม|outlook|review|รีวิว)",
     re.IGNORECASE,
 )
+
+# Tools that mean the task is about THIS machine, not the web. If the router picks any
+# of these, a co-selected web_search is just a fallback — don't force web research.
+_LOCAL_INTENT_TOOLS = {"read_file", "write_file", "edit_file", "delete_file", "list_dir",
+                       "grep", "bash", "python", "current_directory", "set_workdir",
+                       "opencode", "install_dep"}
 
 # Knowledge-gap / low-confidence markers in a DRAFT answer. When the model
 # answers a factual question but hedges like this, it means "I don't really
@@ -3067,6 +3340,40 @@ TASK_KEYWORD_TOOLS = [
         r"|วันนี้.*?วันที่.*?เท่าไหร่)",
         re.IGNORECASE),
      ["current_datetime"]),
+    # Date/time — broaden past the noun-only form: bare time words + day/month/year
+    (re.compile(r"(กี่โมง|เวลา(เท่าไหร่|ตอนนี้|ปัจจุบัน)|วันนี้วันอะไร|วันอะไร|"
+                r"วันที่เท่าไหร่|เดือนอะไร|ปีอะไร|ปีนี้ปี|"
+                r"what\s+(day|month|year|time)\b|what'?s\s+the\s+(date|time|day)|"
+                r"the\s+time\s+now|current\s+timestamp)", re.IGNORECASE),
+     ["current_datetime"]),
+    # Current working directory — was entirely missing (0% keyword coverage)
+    (re.compile(r"(\bcwd\b|\bpwd\b|working\s+director|current\s+(director|path|folder)|"
+                r"which\s+(director|folder)|where\s+am\s+i|home\s+director|present\s+working|"
+                r"ไดเรกทอรีไหน|โฟลเดอร์ไหน|โฟลเดอร์ที่ทำงาน|path\s*ปัจจุบัน|"
+                r"อยู่(ที่)?(โฟลเดอร์|ไดเรกทอรี)ไหน|full\s*path\s*ของ)", re.IGNORECASE),
+     ["current_directory"]),
+    # Read a file referenced by NAME/EXTENSION/PATH (not just the literal word "file")
+    (re.compile(r"(อ่าน|read|เปิด|open|สรุป|summarize|\bcat\b|view|show|ดู)"
+                r".{0,30}([\w./\-]+\.(py|js|ts|tsx|jsx|md|json|csv|txt|xlsx|xls|pptx|docx|pdf|"
+                r"go|rs|java|c|cpp|h|html|css|scss|yaml|yml|toml|ini|cfg|log|sh|sql|env)\b"
+                r"|bin/[\w.\-]+)", re.IGNORECASE),
+     ["read_file"]),
+    # List dir — "files in", "ls PATH", "how many files" (no literal "folder" needed)
+    (re.compile(r"(มีไฟล์อะไร|ไฟล์อะไร(บ้าง|ในนี้)|ดูไฟล์|รายการไฟล์|กี่ไฟล์|"
+                r"how\s+many\s+files|what\s+files|list\s+(the\s+)?(files|everything|contents)|"
+                r"\bls\b\s|show\s+(me\s+)?(the\s+)?files|contents\s+of\s+(this|the))", re.IGNORECASE),
+     ["list_dir"]),
+    # Grep — "find X in code/repo", "มีคำว่า X ไหม" (no literal "file" needed)
+    (re.compile(r"(\bgrep\b|ค้นหาคำว่า|หาคำว่า|search\s+for\b|"
+                r"find\b.{0,20}\bin\s+(the\s+)?(code|file|repo)|"
+                r"มีคำว่า.{0,12}(ไหม|หรือไม่|อยู่ไหม)|where\s+is\s+.{0,20}\bdefined)", re.IGNORECASE),
+     ["grep"]),
+    # Delete / edit a file referenced by NAME.EXT
+    (re.compile(r"(ลบ|delete|remove|\brm\b|ทิ้ง).{0,25}([\w./\-]+\.\w{1,5}\b)", re.IGNORECASE),
+     ["delete_file"]),
+    (re.compile(r"(แก้ไข|edit|patch|modify|เปลี่ยน|update|replace).{0,30}([\w./\-]+\.\w{1,5}\b)",
+                re.IGNORECASE),
+     ["edit_file", "read_file"]),
 ]
 
 def _keyword_augment(task: str, current: list[str]) -> tuple[list[str], list[str]]:
@@ -3106,7 +3413,12 @@ def smart_route(task: str, agents: dict, skills: dict) -> Optional[dict]:
     )
     short_query = len(task) < 200 and len(task.split()) < 30
     needs_persona = bool(AGENT_HINT_RE.search(task))
-    if kw_tools and short_query and not needs_persona:
+    # Never let the keyword fast-path decide WEB on its own — "ล่าสุด/วันนี้/latest" are
+    # ambiguous (a local "ไฟล์ล่าสุด" matches the same keyword as a web "ข่าวล่าสุด").
+    # If the only thing keywords matched is a web tool, defer to the LLM router so the
+    # web-vs-local call is the model's, not a regex's.
+    kw_has_web = bool(set(kw_tools) & {"web_search", "web_fetch"})
+    if kw_tools and short_query and not needs_persona and not kw_has_web:
         # Honor the opencode-disabled flag exactly like the LLM path does
         if not _FLAGS["opencode_enabled"]:
             kw_tools = [t for t in kw_tools if t != "opencode"]
@@ -3176,6 +3488,9 @@ def smart_route(task: str, agents: dict, skills: dict) -> Optional[dict]:
         "skills": skills_chosen,
         "added_by_keyword": added,
         "fast_path": False,
+        # LLM's own call on whether this needs the web — drives auto-research
+        # instead of a keyword regex. Absent key = router didn't judge (fast path).
+        "web": bool(sel.get("web")),
     }
 
 
@@ -4962,6 +5277,82 @@ def _run_safe_parallel(
             executed_call_keys.add(exec_key)
 
 
+# ── Adaptive tool-mode (native function-calling vs inline-text protocol) ─────
+# Research (2026-06-23) found no single mode wins across models: tool-trained
+# families (gemma4) are far better with native schemas, while some models
+# (qwen3-thinking) regress with native and do better on the text protocol. So we
+# calibrate ONCE per model on a tiny labelled probe and cache the verdict.
+_TOOL_CALIB = [
+    ("read the file README.md",                 "read_file"),
+    ("list the files in this folder",           "list_dir"),
+    ("search for the word TODO in the code",    "grep"),
+    ("run the command ls -la",                  "bash"),
+    ("what time is it right now",               "current_datetime"),
+    ("what is my current working directory",    "current_directory"),
+    ("hello, how are you today?",               None),
+    ("thanks, that's all for now",              None),
+]
+_TOOL_MODE_CACHE: dict[str, str] = {}
+_tool_mode_loaded = False
+
+def _load_tool_modes() -> None:
+    global _tool_mode_loaded
+    if _tool_mode_loaded:
+        return
+    _tool_mode_loaded = True
+    try:
+        _TOOL_MODE_CACHE.update(json.loads(TOOL_MODE_FILE.read_text()))
+    except Exception:
+        pass
+
+def _save_tool_modes() -> None:
+    try:
+        TOOL_MODE_FILE.write_text(json.dumps(_TOOL_MODE_CACHE, ensure_ascii=False, indent=1))
+    except Exception:
+        pass
+
+def _calibrate_tool_mode(model: str, tools_on) -> tuple[str, int, int]:
+    """Run the labelled probe in both modes; return (mode, native_score, text_score)."""
+    enabled = tools_on if isinstance(tools_on, dict) else TOOLS
+    schema = _ollama_tools_schema(enabled)
+    sysblk = tools_system_block(enabled, [])
+    known = set(TOOLS)
+    def _run(native: bool) -> int:
+        ok = 0
+        for q, exp in _TOOL_CALIB:
+            try:
+                reply, _ = generate_reply([{"role": "user", "content": q}], sysblk,
+                                          max_tokens=200,
+                                          tools=(schema if native else None))
+                calls, _ = parse_tool_calls(reply, known_tools=known)
+                names = {c.get("name") for c in calls}
+            except Exception:
+                names = set()
+            ok += (not names) if exp is None else (exp in names)
+        return ok
+    n_native, n_text = _run(True), _run(False)
+    return ("native" if n_native >= n_text else "text"), n_native, n_text
+
+def _use_native_tools(model: str, tools_on) -> bool:
+    """Decide whether to hand `model` the native tool schema this turn."""
+    if _TOOL_MODE_OVERRIDE == "native":
+        return True
+    if _TOOL_MODE_OVERRIDE in ("text", "off", "router"):
+        return False
+    _load_tool_modes()
+    if model not in _TOOL_MODE_CACHE:
+        try:
+            with console.status(f"[dim]calibrating tool-mode for {model}…[/]"):
+                mode, nn, nt = _calibrate_tool_mode(model, tools_on)
+            _TOOL_MODE_CACHE[model] = mode
+            _save_tool_modes()
+            console.print(f"[dim]· tool-mode[/] [cyan]{model}[/] → [bold]{mode}[/]"
+                          f" [dim](native {nn}/{len(_TOOL_CALIB)} · text {nt}/{len(_TOOL_CALIB)})[/]")
+        except Exception:
+            _TOOL_MODE_CACHE[model] = "native"   # safe default: pre-existing behaviour
+    return _TOOL_MODE_CACHE.get(model) == "native"
+
+
 def agent_turn(history, *, system, image, audio, max_tokens,
                tools_on, allow_dangerous, max_iters=6):
     """Agent loop with tolerant tool parsing + self-correction.
@@ -5015,7 +5406,8 @@ def agent_turn(history, *, system, image, audio, max_tokens,
     # format inline <tool_call> text. Built once per turn. MLX path ignores it;
     # models without native support simply fall back to the text protocol.
     _ollama_tools = (_ollama_tools_schema(tools_on)
-                     if (tools_on and mm.backend == "ollama") else None)
+                     if (tools_on and mm.backend == "ollama"
+                         and _use_native_tools(mm.name, tools_on)) else None)
 
     for it in range(max_iters):
         iter_t0 = time.time()
@@ -5790,8 +6182,20 @@ _RELAY_TOOLS_SYS = (
     "it verbatim too — the machine restores the real value before running. Never "
     "guess, expand, or invent the value behind a placeholder. Call tools when you "
     "need to act on real data; when you are done, reply with the final answer and "
-    "no tool call."
+    "no tool call. IMPORTANT: do NOT narrate your plan as prose and stop — if the "
+    "task still needs an action (write a file, run a command), EMIT THE TOOL CALL "
+    "now instead of describing it. Reply with a final answer ONLY when the work is "
+    "actually finished (e.g. the output file has been written and verified)."
 )
+
+# Planning/intent markers (EN+TH): a no-tool-call reply containing these usually means
+# the cloud described its next step but forgot to emit the call — nudge it to act rather
+# than treating the narration as the final answer (premature termination guard).
+_RELAY_PLANNING_RE = re.compile(
+    r"\b(we need to|i(?:'ll| will| need to| should)|let me|let'?s|next( step)?|"
+    r"now i|going to|then (i|we)|use python|write (the |a |to )|create (the |a )|"
+    r"generate (the |a )|i'?m going)\b|จะเขียน|จะสร้าง|จะทำ|ต่อไป|ขั้นต่อไป|ต้องเขียน|ต้องสร้าง|ขอเขียน",
+    re.I)
 
 # Tools whose output is free-form text (may carry names the regex rules miss) →
 # run the local NER pass when re-masking their result. bash/python output is
@@ -5895,6 +6299,10 @@ def run_relay_agent_loop(history, *, cloud_model, vault, tools_on, allow_dangero
     # to continue instead of aborting the tool loop. Mirrors agent_turn's MAX_EMPTY_NUDGES.
     empty_nudges = 0
     MAX_EMPTY_NUDGES = 3
+    # Action-narration budget — a no-tool-call turn that reads like an unfinished plan
+    # ("we need to write …") gets nudged to emit the call instead of ending the task.
+    action_nudges = 0
+    MAX_ACTION_NUDGES = 3
 
     for it in range(max_iters):
         meta["iters"] = it + 1
@@ -5919,11 +6327,26 @@ def run_relay_agent_loop(history, *, cloud_model, vault, tools_on, allow_dangero
 
         calls, _notes = parse_tool_calls(out, known_tools=known_tools)
         if not calls:
+            # No tool call. Usually this IS the final answer — but thinking cloud models
+            # often narrate their NEXT step as prose and stop ("we need to write …"),
+            # which would end a multi-step task (read→process→write) prematurely. If the
+            # reply reads like an unfinished plan, nudge to actually emit the call rather
+            # than accepting the narration as done. Bounded so a genuine answer still ends.
+            if (_RELAY_PLANNING_RE.search(out or "") and action_nudges < MAX_ACTION_NUDGES
+                    and it < max_iters - 1):
+                action_nudges += 1
+                cloud_history.append({"role": "user", "content":
+                    "You described the next step but did not emit a tool call. EMIT THE "
+                    "TOOL CALL NOW to actually do it (e.g. write_file with the content, or "
+                    "bash to run a script). Do not just describe it. Only reply with a "
+                    "final answer once the output file is written and verified."})
+                continue
             final = vault.unmask(out)            # no tool call → this is the answer
             meta["residual"] = "__PII_" in (final or "")
             meta["stats"] = vault.stats()
             return final, meta
         empty_nudges = 0                         # productive turn → reset stall budget
+        action_nudges = 0                        # productive turn → reset action budget
 
         for call in calls:
             name = call.get("name")
@@ -5964,6 +6387,166 @@ def run_relay_agent_loop(history, *, cloud_model, vault, tools_on, allow_dangero
     else:
         final = vault.unmask(next((h["content"] for h in reversed(cloud_history)
                                    if h.get("role") == "assistant"), ""))
+    meta["residual"] = "__PII_" in (final or "")
+    meta["stats"] = vault.stats()
+    meta["maxed"] = True
+    return (final or None), meta
+
+
+# ╔════════════════════════════════════════════════════════════════════════╗
+# ║ Local-only relay — cloud DIRECTS, local EXECUTES, content never leaves  ║
+# ╚════════════════════════════════════════════════════════════════════════╝
+# The strongest privacy posture: unlike agentic relay (where masked tool RESULTS go
+# back to the cloud), here the cloud never sees file content at all — masked or not.
+# It only emits one plain-language step at a time and reads a short, content-free
+# status line in return. The LOCAL model does every read/edit/run on real data.
+#
+# Why this exists: a small local model often can't PLAN a multi-step task well, but it
+# CAN carry out a single concrete instruction ("open config.py and add a 30s timeout").
+# So we split the labour — the cloud supplies the reasoning, the local model supplies
+# the hands and eyes — without any file content crossing the network.
+_RELAY_LOCAL_SYS = (
+    "You are a DIRECTOR coordinating a separate LOCAL agent that runs on the user's "
+    "machine. The LOCAL agent does ALL the actual work — reading, editing, and running "
+    "files. You NEVER see file contents, command output, or code: only short status "
+    "reports after each step. The task may contain __PII_LABEL_N__ placeholders; treat "
+    "each as an opaque token, copy it verbatim, and never guess what is behind it.\n\n"
+    "Work ONE step at a time. Each of your turns must output EITHER:\n"
+    "  • a single concrete instruction for the local agent (an imperative step, e.g. "
+    "\"Find the function that validates the login token and add a null check\"), OR\n"
+    "  • when the goal is fully achieved, a line beginning EXACTLY with \"DONE:\" "
+    "followed by a short summary for the user.\n\n"
+    "Rules: never ask to see file contents — you will not get them; reason only from the "
+    "status reports. Do not number your steps, add preamble, or use markdown. Output just "
+    "the one instruction line, or the DONE line."
+)
+
+# Distils the local executor's (possibly long, content-bearing) reply into ONE abstract
+# status line. Runs on the LOCAL model — its output is the only thing that, after masking,
+# reaches the cloud, so it is explicitly told to omit file contents and code.
+_RELAY_LOCAL_STATUS_PROMPT = (
+    "สรุปผลของขั้นตอนที่เพิ่งทำเป็น 1 บรรทัดสั้น ๆ สำหรับผู้กำกับงาน: บอกแค่ว่า 'ทำอะไรสำเร็จ' "
+    "หรือ 'ติดปัญหาอะไร' เท่านั้น. ⛔ ห้ามใส่เนื้อหาไฟล์ โค้ด ชื่อ-ค่าจริง หรือ output ยาว ๆ — "
+    "เอาเฉพาะใจความระดับสรุป. ตอบบรรทัดเดียว ไม่ต้องมี preamble.\n\nผลลัพธ์ของขั้นตอน:\n"
+)
+
+
+def _relay_local_status(local_reply: str, vault, *, ner_fn) -> str:
+    """Turn the local executor's reply into a SHORT, content-free status line, then mask
+    + leak-scan it. If anything risky survives, fall back to a generic marker so no
+    content can ride to the cloud inside the status. Returns a cloud-safe string."""
+    raw = (local_reply or "").strip()
+    if not raw:
+        return "[ขั้นตอนเสร็จบนเครื่อง — ไม่มีผลลัพธ์ที่รายงาน]"
+    try:
+        line, _ = generate_reply(
+            [{"role": "user", "content": _RELAY_LOCAL_STATUS_PROMPT + raw[:4000]}],
+            "", max_tokens=160, temperature=0, think=False)
+        line = (line or "").strip().splitlines()[0] if (line or "").strip() else ""
+    except Exception:
+        line = ""
+    if not line:
+        line = "ดำเนินการขั้นตอนบนเครื่องเสร็จแล้ว"
+    masked = vault.mask(line, ner_fn=ner_fn)
+    if vault.leak_scan(masked):
+        return "[ขั้นตอนเสร็จบนเครื่อง — รายละเอียดถูกกันไว้ในเครื่องเพื่อความปลอดภัย]"
+    return masked
+
+
+def run_relay_local_loop(history, *, cloud_model, vault, tools_on, allow_dangerous,
+                         max_tokens, ner_fn, agent_system="", max_iters=6,
+                         on_event=None):
+    """Local-only relay — the CLOUD is a director, the LOCAL model does the work.
+
+    Per round: the cloud emits ONE plain-text step (over masked task + status history);
+    the local model executes it via agent_turn with full tools on REAL data; the long
+    local reply is distilled locally into a short masked status that is the ONLY thing
+    returned to the cloud. Loops until the cloud says "DONE:" or max_iters is hit.
+
+    File content NEVER leaves the machine — not even masked. Returns (final_text, meta);
+    final_text is None on a hard abort (initial leak or first-round cloud failure) so the
+    caller falls back to a plain local agent_turn.
+    """
+    last_user = max((i for i, h in enumerate(history)
+                     if h.get("role") == "user"), default=-1)
+    real_task = history[last_user].get("content", "") if last_user >= 0 else ""
+    masked_task = vault.mask(real_task, ner_fn=ner_fn) if real_task else ""
+
+    # Leak guard on the only payload that ever leaves: the masked task + planner system.
+    leaks = list(vault.leak_scan(_RELAY_LOCAL_SYS)) + list(vault.leak_scan(masked_task))
+    if leaks:
+        return None, {"aborted": "leak", "leaks": leaks}
+
+    cloud_history = [{"role": "user", "content":
+                      f"TASK:\n{masked_task}\n\nGive the local agent its first step."}]
+    # The local executor keeps its OWN running history (real values, never sent to cloud),
+    # seeded with the goal so it has continuity across steps.
+    local_history = [{"role": "user", "content":
+                      f"[เป้าหมายรวมของงาน]\n{real_task}\n\n"
+                      f"[working dir]\n{_WORKDIR}\n\n"
+                      "ผู้กำกับจะส่งคำสั่งทีละขั้น ทำเฉพาะขั้นที่ได้รับ แล้วรายงานผลสั้น ๆ"}]
+    local_sys = (agent_system or "").strip() or (
+        "คุณคือ executor: ทำตามคำสั่งของผู้กำกับทีละขั้นด้วยเครื่องมือจริงบนเครื่องนี้ "
+        "(อ่าน/แก้ไฟล์ รันคำสั่ง) ภายใน working dir. ทำให้เสร็จจริง อย่าเดา.")
+
+    meta = {"cloud": cloud_model, "steps": 0, "tool_calls": 0, "iters": 0, "tokens": 0}
+
+    for it in range(max_iters):
+        meta["iters"] = it + 1
+        directive, st = generate_reply(cloud_history, _RELAY_LOCAL_SYS,
+                                       max_tokens=max_tokens, model=cloud_model,
+                                       think=False)
+        meta["tokens"] += (st or {}).get("tokens", 0)
+        if directive and directive.startswith("[ollama"):
+            if it == 0:
+                return None, {"aborted": "cloud", "err": directive}
+            break
+        directive = (directive or "").strip()
+        if not directive:
+            cloud_history.append({"role": "user", "content":
+                "(ว่างเปล่า) ออกคำสั่งขั้นถัดไป หรือถ้าเสร็จแล้วตอบขึ้นต้นด้วย DONE:"})
+            continue
+        cloud_history.append({"role": "assistant", "content": directive})
+
+        # Cloud signalled completion.
+        if re.match(r"^\s*done\s*:", directive, re.I):
+            final = vault.unmask(re.sub(r"^\s*done\s*:\s*", "", directive, flags=re.I))
+            meta["residual"] = "__PII_" in (final or "")
+            meta["stats"] = vault.stats()
+            return (final or "เสร็จสิ้น"), meta
+
+        # Otherwise it is a step instruction — restore any placeholders to real values
+        # so the LOCAL agent acts on real data, then execute it locally.
+        real_step = vault.unmask(directive)
+        meta["steps"] += 1
+        if on_event:
+            on_event("step", meta["steps"], real_step)
+        local_history.append({"role": "user", "content":
+                              f"คำสั่งขั้นที่ {meta['steps']}: {real_step}"})
+        local_reply, lstats = agent_turn(
+            local_history, system=local_sys, image=None, audio=None,
+            max_tokens=max_tokens, tools_on=tools_on,
+            allow_dangerous=allow_dangerous, max_iters=max_iters)
+        meta["tool_calls"] += (lstats or {}).get("tool_calls", 0)
+
+        status = _relay_local_status(local_reply, vault, ner_fn=ner_fn)
+        if on_event:
+            on_event("status", meta["steps"], status)
+        cloud_history.append({"role": "user", "content":
+            f"[status รายงานจาก local agent]\n{status}\n\n"
+            "ตัดสินใจขั้นถัดไป หรือถ้างานเสร็จครบแล้วตอบขึ้นต้นด้วย DONE: พร้อมสรุปให้ผู้ใช้"})
+
+    # max_iters reached → one final director turn to summarise what was accomplished.
+    final_dir, st = generate_reply(
+        cloud_history,
+        _RELAY_LOCAL_SYS + "\n\nกำลังจะหมดรอบ — สรุปงานที่ทำสำเร็จให้ผู้ใช้ตอนนี้ "
+        "โดยขึ้นต้นด้วย DONE:",
+        max_tokens=max_tokens, model=cloud_model, think=False)
+    meta["tokens"] += (st or {}).get("tokens", 0)
+    if final_dir and not final_dir.startswith("[ollama"):
+        final = vault.unmask(re.sub(r"^\s*done\s*:\s*", "", final_dir.strip(), flags=re.I))
+    else:
+        final = "ทำงานในโหมด local-only ครบจำนวนรอบแล้ว — ดูผลแต่ละขั้นด้านบน"
     meta["residual"] = "__PII_" in (final or "")
     meta["stats"] = vault.stats()
     meta["maxed"] = True
@@ -6139,6 +6722,59 @@ def _run_and_present_relay_agent(user_msg, store, session_id, history, *, cloud_
     return final
 
 
+def _run_and_present_relay_local(user_msg, store, session_id, history, *, cloud_model,
+                                 vault, tools_on, allow_dangerous, agent_system=""):
+    """Run the LOCAL-ONLY relay loop (cloud directs · local executes · content never
+    leaves), print + persist the unmasked summary, append it to `history`. Returns the
+    summary, or None if aborted (caller falls back to a plain local turn)."""
+    if not _MASK_OK or vault is None:
+        return None
+    console.print("[bold cyan]🛡️  Privacy relay[/] [green](local-only)[/] "
+                  "[dim]— cloud directs · this machine does ALL file work · "
+                  "no content leaves …[/]")
+    t0 = time.time()
+
+    def _on_event(kind, n, payload):
+        if kind == "step":
+            console.print(f"[dim]  🎯 cloud step {n}:[/] [cyan]{(payload or '').strip()[:200]}[/]")
+        elif kind == "status":
+            console.print(f"[dim]  ↩ status → cloud:[/] {(payload or '').strip()[:160]}")
+
+    final, meta = run_relay_local_loop(
+        history, cloud_model=cloud_model, vault=vault, tools_on=tools_on,
+        allow_dangerous=allow_dangerous,
+        max_tokens=_FLAGS.get("relay_reason_tokens", 3072),
+        ner_fn=_relay_ner, agent_system=agent_system,
+        max_iters=int(_FLAGS.get("relay_max_iters", 6) or 6), on_event=_on_event)
+    elapsed = time.time() - t0
+
+    if final is None:
+        why = (meta or {}).get("aborted")
+        if why == "leak":
+            console.print(f"[red]  ✖ leak-scan จับข้อมูลที่ไม่ควรส่งขึ้น cloud "
+                          f"({len((meta or {}).get('leaks', []))} จุด) — ยกเลิกการส่ง[/]")
+        elif why == "cloud":
+            console.print("[yellow]  ⚠ cloud ล้มเหลว[/]"
+                          f"\n[dim]{((meta or {}).get('err') or '')[:200]}[/]")
+        return None
+
+    stats = meta.get("stats", {})
+    summary = ", ".join(f"{v} {k.lower()}" for k, v in sorted(stats.items())) or "ไม่มี"
+    history.append({"role": "assistant", "content": final})
+    try:
+        store.add_message(session_id, "assistant", final[:5000])
+    except Exception:
+        pass
+    console.print(Rule(style="dim"))
+    console.print(Markdown(final))
+    tail = (" · [yellow]มี placeholder เหลือใน output[/]" if meta.get("residual") else "")
+    console.print(f"[dim]🛡️ local-only · {meta.get('steps', 0)} steps · "
+                  f"{meta.get('tool_calls', 0)} tool calls (local) · masked: {summary} · "
+                  f"cloud={cloud_model} · {elapsed:.1f}s{tail}[/]")
+    console.print(Rule(style="dim"))
+    return final
+
+
 def _run_and_present_mask(user_msg, store, session_id, history, *, cloud_model,
                           vault, agent_system=""):
     """Run the relay pipeline, print + persist the unmasked answer, append it to
@@ -6187,7 +6823,7 @@ def _run_and_present_mask(user_msg, store, session_id, history, *, cloud_model,
 # ║ UI helpers                                                            ║
 # ╚════════════════════════════════════════════════════════════════════════╝
 def banner(agents_n, skills_n):
-    title = Text("THMES — Thai Hermes Agentic Shell", style="bold cyan")
+    title = Text(f"THMES v{VERSION} — Thai Hermes Agentic Shell", style="bold cyan")
     sub = Text(f"{agents_n} agents · {skills_n} skills · {len(TOOLS)} tools · /help",
                style="dim")
     console.print(Panel(Group(title, sub), border_style="cyan"))
@@ -6272,6 +6908,8 @@ def help_panel():
         ("/opencode [on|off]",     "🚀 toggle opencode delegation"),
         ("/verbose [on|off]",      "📋 verbose tool panels vs compact lines"),
         ("/auto [on|off|last]",    "🧠 smart-load: model picks its own context"),
+        ("/cd PATH",               "📂 change project root (relative paths + shell resolve here)"),
+        ("/pwd",                   "📂 show project root (working dir)"),
         ("/context",               "📏 show current token usage + remaining"),
         ("/compact [N|on|off|threshold N]", "🗜  summarize old turns (N=keep)"),
         ("/session [list|load ID|new|archive|rename T]", "💾 persistent sessions (SQLite)"),
@@ -6279,7 +6917,7 @@ def help_panel():
         ("/research QUERY [--depth N] [--rounds N]", "🔬 deterministic multi-round research — searches, expands keywords, re-searches"),
         ("/plan TASK [· auto on|off]", "📐 draft+approve a step plan, then execute (seeds /task)"),
         ("/research auto [on|off]", "🔍 toggle auto multi-source hint on factual queries"),
-        ("/relay [on|off|tools|verify|model|cats|deny|vault]", "🛡️  privacy relay: mask→cloud→unmask · tools→local exec · verify→self-heal"),
+        ("/relay [on|off|tools|local|verify|model|cats|deny|vault]", "🛡️  privacy relay: mask→cloud→unmask · tools→local exec · local→cloud directs (content never leaves) · verify→self-heal"),
         ("/continuity [on|off]",   "🆕 auto-detect new topic → fresh session"),
         ("/task [list|add|done N|doing N|clear]", "📋 session task list (model + you share it)"),
         ("/queue [list|clear|on|off]", "📥 type-ahead while model works (opt-in via /queue on)"),
@@ -6317,6 +6955,7 @@ def render_header(state: dict):
     ctx_color = "green" if pct < 50 else "yellow" if pct < 80 else "red"
 
     pieces = [
+        f"[dim]v{VERSION}[/]",
         f"[bold cyan]📦 {mm.name}[/]",
     ]
     if state.get("current_agent"):
@@ -6403,10 +7042,16 @@ def main():
                           f"falling back to first available[/]")
             default_model = next(iter(MODELS), next(iter(OLLAMA_MODELS)))
 
-    # On an Ollama-only machine (no MLX installed) don't default to an MLX model
-    # the user can't load — pressing Enter at the picker would just error. Prefer
-    # the first available Ollama model so the default "just works".
-    if default_model in MODELS and not _mlx_available() and OLLAMA_MODELS:
+    # Default-model preference & safety (Ollama-first):
+    #   • If the user didn't pin THMES_MODEL, prefer an available Ollama model over the
+    #     MLX default — Ollama is the primary backend and needs no MLX install. This is
+    #     what makes the default "just work" on Ollama machines (incl. MLX+Ollama ones).
+    #   • Even if pinned to an MLX alias, fall back to Ollama when MLX isn't importable
+    #     (pressing Enter on a model you can't load would just error).
+    # MLX-only machines (no Ollama discovered) keep their MLX default; an explicit
+    # Ollama tag in THMES_MODEL passes straight through (it's not in MODELS).
+    if default_model in MODELS and OLLAMA_MODELS and (
+            not _THMES_MODEL_EXPLICIT or not _mlx_available()):
         default_model = next(iter(OLLAMA_MODELS))
 
     # ── Model picker — shown once at startup ──────────────────────────────
@@ -6446,12 +7091,16 @@ def main():
         "/skill":    {"desc": "invoke skill", "subs": lambda: list(skills.keys()) + ["list"]},
         "/tool":     {"desc": "manage tools", "subs": lambda: ["list","on","off","allow"] + list(TOOLS.keys())},
         "/opencode": {"desc": "delegation toggle", "subs": lambda: ["on","off"]},
+        "/toolmode": {"desc": "native vs text tool-calling (adaptive per model)",
+                      "subs": lambda: ["auto","native","text","recalibrate","clear","status"]},
         "/verbose":  {"desc": "verbose tool display", "subs": lambda: ["on","off"]},
         "/model":    {"desc": "switch model",
                       "subs": lambda: list(MODELS.keys())
                                       + sorted(OLLAMA_MODELS.keys())
                                       + ["list", "refresh", "unload"]},
         "/auto":     {"desc": "smart-router toggle", "subs": lambda: ["on","off","last"]},
+        "/cd":       {"desc": "change project root (working dir)", "args": "PATH"},
+        "/pwd":      {"desc": "show project root (working dir)"},
         "/context":  {"desc": "show token usage"},
         "/compact":  {"desc": "summarize old history", "subs": lambda: ["on","off","threshold"]},
         "/session":  {"desc": "session manager", "subs": lambda: ["list","new","load","archive","rename"]},
@@ -6459,7 +7108,7 @@ def main():
         "/research": {"desc": "deterministic multi-round keyword-expanding research",
                       "subs": lambda: ["--depth", "--rounds", "auto"]},
         "/relay":    {"desc": "privacy relay: mask→cloud→unmask",
-                      "subs": lambda: ["on","off","tools","verify","model","cats","deny","vault","status"]},
+                      "subs": lambda: ["on","off","tools","local","verify","model","cats","deny","vault","status"]},
         "/plan":     {"desc": "draft a plan before executing",
                       "subs": lambda: ["auto"]},
         "/continuity": {"desc": "topic-continuity auto-detection",
@@ -6890,21 +7539,26 @@ def main():
                     groups = ", ".join(_relay_cfg.get("groups") or DEFAULT_GROUPS)
                     deny = _relay_cfg.get("deny_list") or []
                     eng = "ready" if _MASK_OK else "[red]UNAVAILABLE (lib/thmes_mask.py)[/]"
-                    agentic = ("[magenta]ON[/] [dim](cloud decides · local executes)[/]"
-                               if _FLAGS.get("relay_tools") else "[dim]OFF[/]")
+                    if _FLAGS.get("relay_local"):
+                        mode = ("[green]LOCAL-ONLY[/] [dim](cloud directs · local does all "
+                                "file work · content never leaves)[/]")
+                    elif _FLAGS.get("relay_tools"):
+                        mode = "[magenta]AGENTIC[/] [dim](cloud decides · local executes · results re-masked)[/]"
+                    else:
+                        mode = "[cyan]ONE-SHOT[/] [dim](cloud reasons on masked text, no tools)[/]"
                     vcmd = _FLAGS.get("relay_verify_cmd") or ""
                     vstr = (f"[green]{vcmd}[/] [dim](≤{_FLAGS.get('relay_heal_attempts',3)} รอบ)[/]"
                             if vcmd else "[dim]OFF[/]")
                     console.print(
                         f"[bold cyan]🛡️ Privacy relay[/]  {cur}\n"
                         f"  [dim]cloud (REASON):[/] {cloud}\n"
-                        f"  [dim]agentic tools:[/] {agentic}\n"
+                        f"  [dim]mode:[/] {mode}\n"
                         f"  [dim]self-heal verify:[/] {vstr}\n"
                         f"  [dim]mask groups:[/] {groups}\n"
                         f"  [dim]deny-list:[/] {len(deny)} term(s)\n"
                         f"  [dim]vault:[/] {len(_relay_vault) if _relay_vault else 0} masked this session\n"
                         f"  [dim]engine:[/] {eng}\n"
-                        f"  [dim]usage:[/] /relay on|off · tools on|off · verify <cmd>|off · model [TAG] · cats a,b · deny add|rm TERM · vault")
+                        f"  [dim]usage:[/] /relay on|off · tools on|off · local on|off · verify <cmd>|off · model [TAG] · cats a,b · deny add|rm TERM · vault")
                     continue
                 if sub == "on":
                     _enter_relay_mode()
@@ -6925,6 +7579,23 @@ def main():
                         "  [dim]OFF → one-shot relay (cloud reasons on masked text, no tools).[/]")
                     if act not in ("on", "off", "status"):
                         console.print("[dim]  (usage: /relay tools on|off)[/]")
+                    continue
+                if sub == "local":
+                    act = _rl[1].lower() if len(_rl) > 1 else "status"
+                    if act in ("on", "off"):
+                        _FLAGS["relay_local"] = (act == "on")
+                        if act == "on" and _FLAGS.get("relay_tools"):
+                            console.print("[dim]  (local-only takes precedence over agentic tools while on)[/]")
+                    cur_l = ("[green]ON[/]" if _FLAGS.get("relay_local") else "[dim]OFF[/]")
+                    console.print(
+                        f"[cyan]🛡️ relay local-only:[/] {cur_l}\n"
+                        "  [dim]ON  → cloud is a DIRECTOR: it emits one step at a time and "
+                        "sees only short status reports. THIS machine does ALL reading/"
+                        "editing/running on real data — file content NEVER leaves, not even "
+                        "masked. Best when the local model can execute but not plan well.[/]\n"
+                        "  [dim]OFF → fall back to agentic (/relay tools) or one-shot relay.[/]")
+                    if act not in ("on", "off", "status"):
+                        console.print("[dim]  (usage: /relay local on|off)[/]")
                     continue
                 if sub == "verify":
                     rest = arg.split(None, 1)
@@ -7161,6 +7832,40 @@ def main():
                     cur = "ON" if _FLAGS["opencode_enabled"] else "OFF"
                     console.print(f"[cyan]opencode:[/] {cur}  (usage: /opencode on|off)")
                 continue
+            if cmd == "/toolmode":
+                a = arg.strip().lower()
+                if a in {"auto", "native", "text", "off", "router"}:
+                    globals()["_TOOL_MODE_OVERRIDE"] = "text" if a in {"off", "router"} else a
+                    console.print(f"[green]✓ tool-mode override:[/] {globals()['_TOOL_MODE_OVERRIDE']}"
+                                  f" [dim](auto = calibrate per model)[/]")
+                elif a in {"recalibrate", "recal", "reset"}:
+                    _load_tool_modes()
+                    _TOOL_MODE_CACHE.pop(mm.name, None); _save_tool_modes()
+                    console.print(f"[yellow]✓ cleared calibration for {mm.name}[/] — recalibrates next turn")
+                elif a in {"clear", "clearall"}:
+                    _load_tool_modes(); _TOOL_MODE_CACHE.clear(); _save_tool_modes()
+                    console.print("[yellow]✓ cleared all tool-mode calibration[/]")
+                else:
+                    _load_tool_modes()
+                    cur = _TOOL_MODE_CACHE.get(mm.name, "(uncalibrated)")
+                    console.print(f"[cyan]tool-mode:[/] override=[bold]{_TOOL_MODE_OVERRIDE}[/] · "
+                                  f"{mm.name} → [bold]{cur}[/]\n"
+                                  f"[dim]usage: /toolmode auto|native|text|recalibrate|clear[/]")
+                    for m, md in _TOOL_MODE_CACHE.items():
+                        console.print(f"  [dim]{m}[/] → {md}")
+                continue
+            if cmd == "/pwd":
+                console.print(f"[cyan]📂 working dir (project root):[/] {_WORKDIR}")
+                continue
+            if cmd == "/cd":
+                target = arg.strip() or str(Path.home())
+                ok, msg = _set_workdir(target)
+                if ok:
+                    console.print(f"[green]📂 working dir →[/] [cyan]{msg}[/]")
+                else:
+                    console.print(f"[red]✖ /cd ล้มเหลว:[/] {msg}")
+                continue
+
             if cmd == "/context":
                 ctx = measure_context(history, last_system, mm.processor)
                 native = native_ctx()
@@ -7365,7 +8070,11 @@ def main():
             route_ms = int((time.time() - route_t0) * 1000)
             if sel:
                 last_routed = sel
-                chosen_tools = {k: v for k, v in TOOLS.items() if k in sel["tools"]}
+                # Restrict context to the router's picks — but if it selected NOTHING,
+                # don't cripple the agent: give it the full toolset and let it decide
+                # mid-loop (an empty selection means "unsure", not "no tools needed").
+                chosen_tools = ({k: v for k, v in TOOLS.items() if k in sel["tools"]}
+                                if sel["tools"] else TOOLS)
                 chosen_skills_idx = sel["skills"]
                 if sel["agent"]:
                     chosen_agent = sel["agent"]
@@ -7375,11 +8084,12 @@ def main():
                 s_str = f"[{'cyan' if sel['skills'] else 'dim'}][{','.join(sel['skills']) or '—'}][/]"
                 kw = sel.get("added_by_keyword") or []
                 kw_str = f"  [magenta](+kw:{','.join(kw)})[/]" if kw else ""
+                web_str = "  [blue]🌐 web[/]" if sel.get("web") else ""
                 path_label = "[green]🧠 kw-fast[/]" if sel.get("fast_path") else "[magenta]🧠 routed[/]"
                 console.print(f"{path_label} in {route_ms}ms → "
                               f"[dim]tools=[/]{t_str}  "
                               f"[dim]agent=[/]{a_str}  "
-                              f"[dim]skills=[/]{s_str}{kw_str}")
+                              f"[dim]skills=[/]{s_str}{kw_str}{web_str}")
             else:
                 console.print(f"[yellow]🧠 router failed ({route_ms}ms) — falling back to full context[/]")
 
@@ -7402,7 +8112,16 @@ def main():
                     _agent_sys = custom_system
                 _rl_pre = max(0, len(history) - 1)
                 try:
-                    if _FLAGS.get("relay_tools"):
+                    if _FLAGS.get("relay_local"):
+                        # Local-only sub-mode (precedence): cloud DIRECTS step-by-step,
+                        # this machine does ALL file work on real data, content never
+                        # leaves — the cloud only ever sees short status reports.
+                        _rl_ans = _run_and_present_relay_local(
+                            user_msg, store, session_id, history,
+                            cloud_model=_cloud, vault=_relay_vault,
+                            tools_on=chosen_tools, allow_dangerous=allow_dangerous,
+                            agent_system=_agent_sys)
+                    elif _FLAGS.get("relay_tools"):
                         # Agentic sub-mode: cloud decides tool calls, this machine
                         # executes them locally, results are re-masked back to cloud.
                         _rl_ans = _run_and_present_relay_agent(
@@ -7429,12 +8148,26 @@ def main():
         # and inject the multi-source research hint (Option B). Skipped for
         # tool_result continuations, custom system, explicit agent, or when
         # the user turned it off via /research auto off.
+        # Does this turn need WEB RESEARCH? Use the ROUTER LLM's own tool picks, not a
+        # keyword regex. The web is the PRIMARY intent only when the router picked a web
+        # tool AND no local/file tool — if it also chose list_dir/read_file/bash/grep,
+        # it's a LOCAL task (a big model often adds web_search as a fallback; the agent
+        # loop still has it). This reads "ไฟล์ล่าสุด" → [list_dir,bash,web_search] as
+        # local, and "ราคาทองวันนี้" → [web_search] as web. The standalone web boolean is
+        # noisy (small models mislabel it, big models over-include web_search), so it is
+        # NOT used to trigger here. Regex is only the fallback when the router didn't run.
+        if isinstance(last_routed, dict) and ("web" in last_routed or last_routed.get("tools")):
+            _picked = set(last_routed.get("tools") or [])
+            _needs_web = (bool(_picked & {"web_search", "web_fetch"})
+                          and not bool(_picked & _LOCAL_INTENT_TOOLS))
+        else:
+            _needs_web = bool(_RESEARCH_TRIGGER_RE.search(user_msg))
         research_triggered = bool(
             _FLAGS.get("research_auto", True) and tools_on
             and not custom_system and not current_agent
             and not user_msg.startswith("<tool_result")
             and not user_msg.startswith("[Research]")
-            and _RESEARCH_TRIGGER_RE.search(user_msg)
+            and _needs_web
         )
         if research_triggered:
             # Pre-emptive deterministic research: a clear current-info question
@@ -7694,5 +8427,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if any(a in ("--version", "-V", "version") for a in sys.argv[1:]):
+        print(f"thmes {VERSION}")
+        sys.exit(0)
     try: main()
     except KeyboardInterrupt: console.print("\n[dim]bye[/]")

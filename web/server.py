@@ -43,6 +43,12 @@ try:
 except ImportError:
     sys.exit("THMES Web Terminal needs the 'websockets' package:\n  pip install websockets")
 
+# A non-WebSocket probe to the bridge port (a port scan, a browser favicon, an HTTP GET
+# to the wrong port) makes the websockets library dump a full handshake traceback. Those
+# are harmless rejected connections — silence them so the console stays readable.
+import logging
+logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
+
 
 def _thmes_cmd() -> list:
     """Resolve the command that launches the thmes REPL, portably (this repo is

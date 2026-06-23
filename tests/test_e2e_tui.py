@@ -172,7 +172,7 @@ def kill_session() -> None:
 # ── Prerequisite checks ───────────────────────────────────────────────────
 print("\n=== Prerequisites ===")
 
-_WRAPPER_NAMES   = ("thmes",)
+_WRAPPER_NAMES   = ("dev-thmes",)   # this DEV checkout installs under the dev- prefix
 _VENV_CANDIDATES = ("~/.thmes-env", "~/.mlx-env")
 
 has_tmux    = shutil.which("tmux") is not None
@@ -183,7 +183,7 @@ has_venv    = any(Path(os.path.expanduser(f"{v}/bin/python")).exists()
 skills_dir  = REPO / "skills"
 
 check("tmux available",          has_tmux,    "install tmux first")
-check("thmes/thmes wrapper", has_wrapper, "run setup-mac.sh first")
+check("dev-thmes wrapper", has_wrapper, "run ./install.sh first")
 check("python venv",             has_venv,    "run setup-mac.sh first")
 
 if not (has_tmux and (has_wrapper or has_venv)):
@@ -206,8 +206,8 @@ except Exception as e:
     check("Ollama + gemma4:e4b", False, str(e))
 
 # ── Determine launch command ──────────────────────────────────────────────
-# THMES_BIN overrides everything — lets us e2e a specific checkout (e.g. a fresh
-# clone) even when an installed ~/.local/bin/thmes wrapper exists.
+# THMES_BIN overrides everything — lets us e2e a specific checkout even when an
+# installed wrapper exists.
 _py = next(
     (os.path.expanduser(f"{v}/bin/python") for v in _VENV_CANDIDATES
      if Path(os.path.expanduser(f"{v}/bin/python")).exists()),

@@ -24,13 +24,13 @@ Thumbs.db
 *.log
 .thmes-history
 
-# Optional external CLI shims (not part of THMES core)
+# Private CLI tools (not part of THMES core)
 bin/ctx/
 
-# Local Claude Code config
+# Claude Code local config (machine-specific paths + agent-memory)
 .claude/
 
-# Project-level Claude instructions (local only)
+# Project-level Claude instructions (contains internal service paths)
 CLAUDE.md
 
 # Junk
